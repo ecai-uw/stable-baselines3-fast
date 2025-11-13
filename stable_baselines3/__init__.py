@@ -9,6 +9,7 @@ from stable_baselines3.ppo import PPO
 from stable_baselines3.sac import SAC
 from stable_baselines3.dsrl import DSRL
 from stable_baselines3.td3 import TD3
+from stable_baselines3.fast import FAST
 
 # Read version from file
 version_file = os.path.join(os.path.dirname(__file__), "version.txt")
@@ -31,6 +32,7 @@ __all__ = [
     "SAC",
     "DSRL",
     "TD3",
+    "FAST",
     "HerReplayBuffer",
     "get_system_info",
 ]
