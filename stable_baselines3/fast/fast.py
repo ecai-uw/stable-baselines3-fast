@@ -13,6 +13,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
 from stable_baselines3.common.nets import ContinuousValueNet
 from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
+from stable_baselines3.fast.policies import ResidualActor, ResidualSACPolicy
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
@@ -77,6 +78,9 @@ class FAST(OffPolicyAlgorithm):
 	:param diffusion_act_dim: The action dimension for the diffusion policy (tuple of (action chunk length, action_dim))
 	:param critic_backup_combine_type: How to combine the critics for the backup (min or mean)
     :param base_gamma: the discount factor for the base (slow) critic
+    :param policy_type: Type of fast policy ('residual' only supported currently)
+    :param policy_action_condition: Whether to condition fast policy on base action
+    :param shape_rewards: Whether to use PBRS from base policy values.
     """
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
 		"MlpPolicy": MlpPolicy,
@@ -127,6 +131,7 @@ class FAST(OffPolicyAlgorithm):
 		base_gamma: float = 0.995,
         policy_type: str = 'residual',
         policy_action_condition: bool = False,
+        shape_rewards: bool = False,
 	):
         super().__init__(
 			policy,
@@ -173,8 +178,13 @@ class FAST(OffPolicyAlgorithm):
         self.base_kwargs = base_kwargs
         self.policy_type = policy_type
         self.policy_action_condition = policy_action_condition
+        self.shape_rewards = shape_rewards
 
         assert self.base_gamma >= self.gamma, "base (slow) gamma should be larger than or equal to gamma"
+
+        # Updating Policy and Actor clases.
+        if self.policy_action_condition:
+            self.policy_class = ResidualSACPolicy # this will need to create the residual actor internally
 
         if _init_setup_model:
             self._setup_model()
@@ -218,8 +228,6 @@ class FAST(OffPolicyAlgorithm):
         # Overwrite model policy to create base-conditioned fast policy.
         if self.policy_type != 'residual':
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
-        if self.policy_action_condition:
-            raise NotImplementedError("Base action conditioning not yet implemented for FAST.")
 
         # Creating new base policy to get base critic.
         # TODO: confusing notation; base_policy does not refer to the base diffusion policy
@@ -325,7 +333,8 @@ class FAST(OffPolicyAlgorithm):
                 # add entropy term
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                target_q_values = self.get_rewards(replay_data) + (1 - replay_data.dones) * self.gamma * next_q_values
+                # target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
             
             # Get current Q-values estimates for each critic network
 			# using action from the replay buffer
@@ -382,6 +391,10 @@ class FAST(OffPolicyAlgorithm):
         :param total_steps: Total number of gradient steps to take.
         :param batch_size: Batch size for each gradient update.
         """
+        # Sanity check.
+        if not self.shape_rewards:
+            raise ValueError("train_base_value should only be called when shape_rewards is True.")
+        
         # Switch to train mode.
         self.base_critic.set_training_mode(True)
         # Create learning rate scheduler.
@@ -583,7 +596,8 @@ class FAST(OffPolicyAlgorithm):
         base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 
         # Sample action from fast policy.
-        scaled_action, log_prob = self.policy.actor.action_log_prob(observation)
+        full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
+        scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
         
         # Combine base action and fast policy action.
         if self.policy_type == 'residual':
@@ -607,7 +621,6 @@ class FAST(OffPolicyAlgorithm):
             sample_base: bool = False,
             random_action_dict: dict = {},
     ) -> dict[str, np.ndarray]:
-        
         return_dict = {}
         # First, sample action from base policy.
         noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
@@ -641,7 +654,8 @@ class FAST(OffPolicyAlgorithm):
                 scaled_action = unscaled_action
         else:
             # Use predict() otherwise -this unsquashes, so re-scale if needed.
-            unscaled_action, predict_second_return = self.predict(observation, state, episode_start, deterministic)
+            full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
+            unscaled_action, predict_second_return = self.predict(full_obs, state, episode_start, deterministic)
             if isinstance(self.action_space, spaces.Box):
                 scaled_action = self.policy.scale_action(unscaled_action)
             else:
@@ -662,6 +676,11 @@ class FAST(OffPolicyAlgorithm):
 
         return return_dict
     
-    def shape_reward(self):
-        # TODO: IMPLEMENT THIS
-        pass
+    def get_rewards(self, replay_data):
+        if self.shape_rewards:
+            rewards = replay_data.rewards + \
+                  self.gamma * self.value_net(replay_data.next_observations).detach() - \
+                  self.value_net(replay_data.observations).detach()
+        else:
+            rewards = replay_data.rewards
+        return rewards
