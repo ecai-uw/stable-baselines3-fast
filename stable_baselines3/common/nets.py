@@ -45,7 +45,7 @@ class ContinuousValueNet(BaseModel):
 
         # Create the value network.
         self.value_net = nn.Sequential(
-            *create_mlp(self.features_dim, 1, net_arch, activation_fn, post_linear_modules)
+            *create_mlp(self.features_dim, 1, net_arch, activation_fn, post_linear_modules=post_linear_modules)
         )
         self.add_module("value_net", self.value_net)
 
