@@ -5,8 +5,7 @@ from gymnasium import spaces
 import numpy as np
 from torch import nn
 
-from stable_baselines3.common.distributions import SquashedDiagGaussianDistribution, DiagGaussianDistribution, StateDependentNoiseDistribution
-from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
+from stable_baselines3.common.policies import BaseModel, ContinuousCritic
 from stable_baselines3.common.preprocessing import get_action_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
@@ -14,10 +13,154 @@ from stable_baselines3.common.torch_layers import (
     FlattenExtractor,
     NatureCNN,
     create_mlp,
-    get_actor_critic_arch,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.sac.policies import Actor, SACPolicy, LOG_STD_MAX, LOG_STD_MIN
+
+class BaseCriticValue(BaseModel):
+    """
+    Critic and value network class for a given base policy. This avoids the initialization of 
+    an unused policy network, and handles FAST-specific input processing (i.e. filtering velocity-based 
+    observation features).
+    """
+
+    features_extractor: BaseFeaturesExtractor
+    
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Box,
+        lr_schedule: Schedule,
+        net_arch: list[int],
+        features_extractor_class: type[BaseFeaturesExtractor],
+        features_extractor_kwargs: Optional[dict[str, Any]] = None,
+        activation_fn: type[nn.Module] = nn.ReLU,
+        normalize_images: bool = True,
+        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
+        optimizer_kwargs: Optional[dict[str, Any]] = None,
+        n_critics: int = 2,
+        share_features_extractor: bool = False,
+        post_linear_modules: Optional[list[type[nn.Module]]] = None,
+        non_vel_indices: Optional[list[int]] = None,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor_class=features_extractor_class,
+            features_extractor_kwargs=features_extractor_kwargs,
+            normalize_images=normalize_images,
+            optimizer_class=optimizer_class,
+            optimizer_kwargs=optimizer_kwargs,
+        )
+        self.non_vel_indices = non_vel_indices
+
+        # Creating value kwargs.
+        self.value_kwargs = {
+            "observation_space": observation_space,
+            "action_space": action_space,
+            "net_arch": net_arch,
+            "activation_fn": activation_fn,
+            "normalize_images": normalize_images,
+            "post_linear_modules": post_linear_modules,
+        }
+
+        # Create critic and critic target kwargs.
+        self.critic_kwargs = self.value_kwargs.copy()
+        self.critic_kwargs.update(
+            {
+                "n_critics": n_critics,
+                "share_features_extractor": share_features_extractor,
+            }
+        )
+        self.share_features_extractor = share_features_extractor
+
+        # Some sanity checks.
+        assert share_features_extractor is False, "Sharing features extractor for base critic is not supported."
+
+        # Build.
+        self._build(lr_schedule)
+
+    def _build(self, lr_schedule: Schedule) -> None:
+        # Updating all network kwargs with features extractor.
+        value_kwargs = self._update_features_extractor(self.value_kwargs)
+        critic_kwargs = self._update_features_extractor(self.critic_kwargs)
+        critic_target_kwargs = self._update_features_extractor(self.critic_kwargs)
+
+        # Create networks.
+        self.value_net = ContinuousValue(**value_kwargs).to(self.device)
+        self.critic = ContinuousCritic(**critic_kwargs).to(self.device)
+        self.critic_target = ContinuousCritic(**critic_target_kwargs).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+
+        # Create optimizers.
+        self.value_net.optimizer = self.optimizer_class(
+            self.value_net.parameters(),
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
+        self.critic.optimizer = self.optimizer_class(
+            self.critic.parameters(),
+            lr=lr_schedule(1),
+            **self.optimizer_kwargs,
+        )
+
+        # Target networks should always be in eval mode.
+        self.critic_target.set_training_mode(False)
+        
+    def forward(self, obs: th.Tensor, action: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        raise NotImplementedError()
+    
+    def filter_obs(self, obs: th.Tensor) -> th.Tensor:
+        if self.non_vel_indices is not None:
+            return obs[:, self.non_vel_indices]
+        else:
+            return obs
+
+    def forward_q(self, obs: th.Tensor, action: th.Tensor) -> th.Tensor:
+        return self.critic(self.filter_obs(obs), action)
+
+    def forward_qt(self, obs: th.Tensor, action: th.Tensor) -> th.Tensor:
+        return self.critic_target(self.filter_obs(obs), action)
+
+    def forward_v(self, obs: th.Tensor) -> th.Tensor:
+        return self.value_net(self.filter_obs(obs))
+    
+
+class ContinuousValue(BaseModel):
+    """
+    Simple implementation for a continuous state-based value function.
+    """
+
+    features_extractor: BaseFeaturesExtractor
+
+    def __init__(
+        self,
+        observation_space: spaces.Space,
+        action_space: spaces.Box,
+        net_arch: list[int],
+        features_extractor: BaseFeaturesExtractor,
+        features_dim: int,
+        activation_fn: type[nn.Module] = nn.ReLU,
+        normalize_images: bool = True,
+        post_linear_modules: Optional[list[type[nn.Module]]] = None,
+    ):
+        super().__init__(
+            observation_space,
+            action_space,
+            features_extractor=features_extractor,
+            normalize_images=normalize_images,
+        )
+        # Create value network.
+        self.value_net = nn.Sequential(
+            *create_mlp(features_dim, 1, net_arch, activation_fn, post_linear_modules=post_linear_modules)
+        )
+        self.add_module("value_net", self.value_net)
+
+    def forward(self, obs: th.Tensor) -> th.Tensor:
+        features = self.extract_features(obs, self.features_extractor)
+        value = self.value_net(features)
+        return value
+
 
 class ResidualActor(Actor):
 
@@ -77,7 +220,6 @@ class ResidualActor(Actor):
         if not self.standard_gauss_init:
             log_std = th.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
         return mean_actions, log_std, dict()
-
 
 class ResidualSACPolicy(SACPolicy):
     """

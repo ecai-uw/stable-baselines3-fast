@@ -11,9 +11,8 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
-from stable_baselines3.common.nets import ContinuousValueNet
 from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
-from stable_baselines3.fast.policies import ResidualActor, ResidualSACPolicy
+from stable_baselines3.fast.policies import BaseCriticValue, ResidualSACPolicy
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
@@ -92,7 +91,7 @@ class FAST(OffPolicyAlgorithm):
     critic: ContinuousCritic
     critic_target: ContinuousCritic
     critic_base: ContinuousCritic
-    value_net: ContinuousValueNet
+    base_critic_value: BaseCriticValue
 
     def __init__(
 		self,
@@ -132,6 +131,7 @@ class FAST(OffPolicyAlgorithm):
         policy_type: str = 'residual',
         policy_action_condition: bool = False,
         shape_rewards: bool = False,
+        cfg: dict = {},
 	):
         super().__init__(
 			policy,
@@ -170,6 +170,9 @@ class FAST(OffPolicyAlgorithm):
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
         self.actor_gradient_steps = actor_gradient_steps
 
+        # TODO: clean up; abstract as many params as possible into this cfg
+        self.cfg = cfg
+
         self.diffusion_policy = diffusion_policy
         self.diffusion_act_chunk = diffusion_act_dim[0]
         self.diffusion_act_dim = diffusion_act_dim[1]
@@ -180,11 +183,33 @@ class FAST(OffPolicyAlgorithm):
         self.policy_action_condition = policy_action_condition
         self.shape_rewards = shape_rewards
 
+
+        self.residual_scale_schedule = self.cfg.policy.residual_scale_schedule
+        self.residual_scale = self.cfg.policy.residual_scale
+        self.drop_velocity = self.cfg.policy.drop_velocity
+        self.observation_meta = self.cfg.env.observation_meta
+
+        # Sanity checks.
         assert self.base_gamma >= self.gamma, "base (slow) gamma should be larger than or equal to gamma"
 
         # Updating Policy and Actor clases.
         if self.policy_action_condition:
             self.policy_class = ResidualSACPolicy # this will need to create the residual actor internally
+
+        # Processing observation meta.
+        if self.drop_velocity:
+            self.non_vel_indices = []
+            total_obs_size = 0
+            for key, size in self.observation_meta.items():
+                if 'qpos' not in key:
+                    self.non_vel_indices.extend(list(range(total_obs_size, total_obs_size + size)))
+                total_obs_size += size
+            if len(self.non_vel_indices) == 0:
+                raise ValueError("All observation indices are velocity indices.")
+            if len(self.non_vel_indices) == total_obs_size:
+                raise ValueError("drop_velocity is set but no velocity indices found; check observation_meta settings.")
+        else:
+            self.non_vel_indices = None
 
         if _init_setup_model:
             self._setup_model()
@@ -230,34 +255,28 @@ class FAST(OffPolicyAlgorithm):
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
         # Creating new base policy to get base critic.
-        # TODO: confusing notation; base_policy does not refer to the base diffusion policy
         # TODO: In the long term, this logic is probably cleaner if it just overwrites the _setup_model of OffPolicyAlgorithm
-        self.base_policy = self.policy_class(
-            self.observation_space,
-            self.action_space,
-            self.lr_schedule,
-            **self.base_kwargs,
-        )
-        self.base_critic = self.base_policy.critic.to(self.device)
-        self.base_critic_target = self.base_policy.critic_target.to(self.device)
-        
-        # Creating base value net, with same architecture/optimizer settings as base critic.
-        value_kwargs = {
-            "observation_space": self.observation_space,
+        if self.drop_velocity:
+            if not isinstance(self.observation_space, spaces.Box):
+                raise ValueError("drop_velocity is currently only supported for Box observation spaces.")
+            base_observation_space = spaces.Box(
+                low=self.observation_space.low[self.non_vel_indices],
+                high=self.observation_space.high[self.non_vel_indices],
+                dtype=self.observation_space.dtype,
+            )
+        else:
+            base_observation_space = self.observation_space
+
+        # Creating base critic and base value net.
+        self.base_kwargs.update({
+            "observation_space": base_observation_space,
             "action_space": self.action_space,
             "lr_schedule": self.lr_schedule,
-            "net_arch": self.base_kwargs["net_arch"]["qf"],
-            "features_extractor_class": self.base_policy.features_extractor_class,
-            "features_extractor_kwargs": self.base_policy.features_extractor_kwargs,
-            "activation_fn": self.base_kwargs["activation_fn"],
-            "optimizer_class": self.base_policy.optimizer_class,
-            "optimizer_kwargs": self.base_policy.optimizer_kwargs,
-            "lr_schedule": self.lr_schedule,
-            "post_linear_modules": self.base_kwargs["post_linear_modules"],
-        }
-        self.value_net = ContinuousValueNet(**value_kwargs).to(self.device)
+            "features_extractor_class": self.policy.features_extractor_class,
+            "non_vel_indices": self.non_vel_indices,
+        })
+        self.base_critic_value = BaseCriticValue(**self.base_kwargs).to(self.device)
 
-    
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor # fast policy 
         self.critic = self.policy.critic # fast critic
@@ -396,9 +415,9 @@ class FAST(OffPolicyAlgorithm):
             raise ValueError("train_base_value should only be called when shape_rewards is True.")
         
         # Switch to train mode.
-        self.base_critic.set_training_mode(True)
+        self.base_critic_value.critic.set_training_mode(True)
         # Create learning rate scheduler.
-        lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic.optimizer, T_max=fqe_steps)
+        lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.critic.optimizer, T_max=fqe_steps)
 
         # for step in tqdm(range(total_steps)):
         with tqdm(range(fqe_steps)) as pbar:
@@ -419,7 +438,7 @@ class FAST(OffPolicyAlgorithm):
                     next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 
                     # Compute next Q values using base critic target.
-                    next_q_values = th.cat(self.base_critic_target(replay_data.next_observations, next_actions), dim=1)
+                    next_q_values = th.cat(self.base_critic_value.forward_qt(replay_data.next_observations, next_actions), dim=1)
                     if self.critic_backup_combine_type == 'min':
                         next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
                     elif self.critic_backup_combine_type == 'mean':
@@ -429,28 +448,28 @@ class FAST(OffPolicyAlgorithm):
                     target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.base_gamma * next_q_values
 
                 # Compute current Q values, with actions in the buffer.
-                current_q_values = self.base_critic(replay_data.observations, replay_data.actions)
+                current_q_values = self.base_critic_value.forward_q(replay_data.observations, replay_data.actions)
 
                 # Compute critic loss.
                 critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
                 pbar.set_postfix(critic_loss=critic_loss.item())
 
                 # Optimize.
-                self.base_critic.optimizer.zero_grad()
+                self.base_critic_value.critic.optimizer.zero_grad()
                 critic_loss.backward()
-                self.base_critic.optimizer.step()
+                self.base_critic_value.critic.optimizer.step()
                 lr_scheduler.step()
 
                 # Update target networks.
                 if step % self.target_update_interval == 0:
                     # NOTE: this skips updating running stats, since the critic is assumed to not use batch norm
-                    polyak_update(self.base_critic.parameters(), self.base_critic_target.parameters(), self.tau)
+                    polyak_update(self.base_critic_value.critic.parameters(), self.base_critic_value.critic_target.parameters(), self.tau)
 
-        self.base_critic.set_training_mode(False)
+        self.base_critic_value.critic.set_training_mode(False)
 
         # Now, distill base critic into base value function.
-        self.value_net.set_training_mode(True)
-        value_lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.value_net.optimizer, T_max=vd_steps)
+        self.base_critic_value.value_net.set_training_mode(True)
+        value_lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.value_net.optimizer, T_max=vd_steps)
         with tqdm(range(vd_steps)) as pbar:
             for step in pbar:
                 # Sample replay buffer.
@@ -464,23 +483,23 @@ class FAST(OffPolicyAlgorithm):
                     actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
                     
                     # Compute Q values using base critic; average across critics and across vd_samples.
-                    mean_q_values = th.cat(self.base_critic(obs, actions), dim=1).mean(dim=1, keepdim=True)
+                    mean_q_values = th.cat(self.base_critic_value.forward_q(obs, actions), dim=1).mean(dim=1, keepdim=True)
                     mean_q_values = mean_q_values.reshape(batch_size, vd_samples).mean(dim=1, keepdim=True)
                 
                 # Compute current V values.
-                current_v_values = self.value_net(replay_data.observations)
+                current_v_values = self.base_critic_value.forward_v(replay_data.observations)
 
                 # Compute value loss.
                 value_loss = F.mse_loss(current_v_values, mean_q_values)
                 pbar.set_postfix(value_loss=value_loss.item())
 
                 # Optimize.
-                self.value_net.optimizer.zero_grad()
+                self.base_critic_value.value_net.optimizer.zero_grad()
                 value_loss.backward()
-                self.value_net.optimizer.step()
+                self.base_critic_value.value_net.optimizer.step()
                 value_lr_scheduler.step()
 
-        self.value_net.set_training_mode(False)
+        self.base_critic_value.value_net.set_training_mode(False)
 
     def learn(
         self: SelfFAST,
@@ -540,11 +559,15 @@ class FAST(OffPolicyAlgorithm):
             random_action_dict['n_envs'] = n_envs
             if action_noise is not None:
                 random_action_dict['action_noise'] = action_noise
-        # PICK UP FROM HERE 
+        # Setting residual scale based on residual scale schedule.
+        residual_scale = max(
+            (self.num_timesteps / self.residual_scale_schedule) * self.residual_scale, self.residual_scale
+        )
         action_dict = self.get_combined_action(
             observation=self._last_obs,
             deterministic=False,
             random_action_dict=random_action_dict,
+            residual_scale=residual_scale,
         )
         final_action = action_dict['final_action']
         buffer_action = final_action # Buffer action is the final combined action.
@@ -578,6 +601,7 @@ class FAST(OffPolicyAlgorithm):
             deterministic=deterministic,
             sample_base=sample_base,
             random_action_dict={},
+            residual_scale=self.residual_scale,
         )
         return action_dict['final_action'], action_dict.get('predict_second_return', None)
 
@@ -598,6 +622,7 @@ class FAST(OffPolicyAlgorithm):
         # Sample action from fast policy.
         full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
         scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
+        scaled_action = th.clamp(scaled_action, -self.residual_scale, self.residual_scale)
         
         # Combine base action and fast policy action.
         if self.policy_type == 'residual':
@@ -620,6 +645,7 @@ class FAST(OffPolicyAlgorithm):
             deterministic: bool = False,
             sample_base: bool = False,
             random_action_dict: dict = {},
+            residual_scale: float = 0.0,
     ) -> dict[str, np.ndarray]:
         return_dict = {}
         # First, sample action from base policy.
@@ -664,6 +690,7 @@ class FAST(OffPolicyAlgorithm):
 
         # Combine base action and fast policy action.
         if self.policy_type == 'residual':
+            scaled_action = np.clip(scaled_action, -residual_scale, residual_scale)
             # NOTE: this assumes action space is normalized to [-1, 1]
             final_action = np.clip(base_action + scaled_action, -1, 1)
         else:
@@ -679,8 +706,8 @@ class FAST(OffPolicyAlgorithm):
     def get_rewards(self, replay_data):
         if self.shape_rewards:
             rewards = replay_data.rewards + \
-                  self.gamma * self.value_net(replay_data.next_observations).detach() - \
-                  self.value_net(replay_data.observations).detach()
+                  self.gamma * self.base_critic_value.forward_v(replay_data.next_observations).detach() - \
+                  self.base_critic_value.forward_v(replay_data.observations).detach()
         else:
             rewards = replay_data.rewards
         return rewards
