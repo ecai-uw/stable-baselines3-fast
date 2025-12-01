@@ -704,6 +704,9 @@ class FAST(OffPolicyAlgorithm):
         return return_dict
     
     def get_rewards(self, replay_data):
+        """
+        For clarity, should type replay_data argument: dict or ReplayBufferSamples?
+        """
         if self.shape_rewards:
             rewards = replay_data.rewards + \
                   self.gamma * self.base_critic_value.forward_v(replay_data.next_observations).detach() - \
@@ -711,3 +714,8 @@ class FAST(OffPolicyAlgorithm):
         else:
             rewards = replay_data.rewards
         return rewards
+    
+    def get_shaped_rewards(self, obs, next_obs):
+        # TODO: get_rewards function should directly call this function
+        return self.gamma * self.base_critic_value.forward_v(next_obs).detach() - \
+                self.base_critic_value.forward_v(obs).detach()
