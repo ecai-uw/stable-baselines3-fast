@@ -19,6 +19,7 @@ from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
 from tqdm import tqdm
+import warnings
 
 SelfFAST = TypeVar("SelfFAST", bound="FAST")
 
@@ -412,7 +413,20 @@ class FAST(OffPolicyAlgorithm):
         """
         # Sanity check.
         if not self.shape_rewards:
-            raise ValueError("train_base_value should only be called when shape_rewards is True.")
+            # TODO: this is really hacky, may need to clean up alter
+            warnings.simplefilter("always")
+            # ANSI escape codes for colors
+            RED = "\033[91m"
+            YELLOW = "\033[93m"
+            RESET = "\033[0m"
+
+            def colored_warning(message, category, filename, lineno, file=None, line=None):
+                # Customize the warning message format
+                print(f"{YELLOW}Warning: {message} ({category.__name__}) at {filename}:{lineno}{RESET}")
+
+            # Override the default showwarning
+            warnings.showwarning = colored_warning
+            warnings.warn("FAST.train_base_value() called with shape_rewards=False; learned value will not be used for reward shaping.", UserWarning)
         
         # Switch to train mode.
         self.base_critic_value.critic.set_training_mode(True)
