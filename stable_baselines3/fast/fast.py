@@ -19,6 +19,7 @@ from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
 from tqdm import tqdm
+from functools import partial
 import warnings
 
 SelfFAST = TypeVar("SelfFAST", bound="FAST")
@@ -78,7 +79,6 @@ class FAST(OffPolicyAlgorithm):
 	:param diffusion_act_dim: The action dimension for the diffusion policy (tuple of (action chunk length, action_dim))
 	:param critic_backup_combine_type: How to combine the critics for the backup (min or mean)
     :param base_gamma: the discount factor for the base (slow) critic
-    :param policy_type: Type of fast policy ('residual' only supported currently)
     :param policy_action_condition: Whether to condition fast policy on base action
     :param shape_rewards: Whether to use PBRS from base policy values.
     """
@@ -126,10 +126,9 @@ class FAST(OffPolicyAlgorithm):
 		_init_setup_model: bool = True,
 		actor_gradient_steps: int = -1,
 		diffusion_policy=None,
-		diffusion_act_dim=None,
+		diffusion_act_dim=(1, 1),
         critic_backup_combine_type='min',
 		base_gamma: float = 0.995,
-        policy_type: str = 'residual',
         policy_action_condition: bool = False,
         shape_rewards: bool = False,
         cfg: dict = {},
@@ -180,14 +179,22 @@ class FAST(OffPolicyAlgorithm):
         self.critic_backup_combine_type = critic_backup_combine_type
         self.base_gamma = base_gamma
         self.base_kwargs = base_kwargs
-        self.policy_type = policy_type
+        # self.policy_type = policy_type
         self.policy_action_condition = policy_action_condition
         self.shape_rewards = shape_rewards
 
 
-        self.residual_scale_schedule = self.cfg.policy.residual_scale_schedule
-        self.residual_scale = self.cfg.policy.residual_scale
+        if _init_setup_model:
+            self._setup_model()
+        
+    def _setup_model(self) -> None:
+        # Extracting base policy config params.
+        self.policy_type = self.cfg.policy.type
+        self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
+        self.residual_mag = self.cfg.policy.residual_mag
         self.drop_velocity = self.cfg.policy.drop_velocity
+
+        # Observation meta for processing observations.
         self.observation_meta = self.cfg.env.observation_meta
 
         # Sanity checks.
@@ -195,7 +202,13 @@ class FAST(OffPolicyAlgorithm):
 
         # Updating Policy and Actor clases.
         if self.policy_action_condition:
-            self.policy_class = ResidualSACPolicy # this will need to create the residual actor internally
+            self.policy_class = partial(
+                ResidualSACPolicy, 
+                policy_type=self.policy_type, 
+                chunk_size=self.diffusion_act_chunk,
+                act_dim=self.diffusion_act_dim,
+            )
+            # self.policy_class = ResidualSACPolicy # this will need to create the residual actor internally
 
         # Processing observation meta.
         if self.drop_velocity:
@@ -211,11 +224,7 @@ class FAST(OffPolicyAlgorithm):
                 raise ValueError("drop_velocity is set but no velocity indices found; check observation_meta settings.")
         else:
             self.non_vel_indices = None
-
-        if _init_setup_model:
-            self._setup_model()
-        
-    def _setup_model(self) -> None:
+            
         super()._setup_model()
         self._create_aliases()
         # Running mean and running var
@@ -252,7 +261,8 @@ class FAST(OffPolicyAlgorithm):
         
 
         # Overwrite model policy to create base-conditioned fast policy.
-        if self.policy_type != 'residual':
+        # if self.policy_type != 'residual':
+        if self.policy_type not in ["residual", "residual_scale"]:
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
         # Creating new base policy to get base critic.
@@ -534,15 +544,23 @@ class FAST(OffPolicyAlgorithm):
         )
     
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + ["actor", "critic", "critic_target"]  # noqa: RUF005
+        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy", "base_critic_value"]  # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
+        # Standard SAC save parameters.
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
         if self.ent_coef_optimizer is not None:
             saved_pytorch_variables = ["log_ent_coef"]
             state_dicts.append("ent_coef_optimizer")
         else:
             saved_pytorch_variables = ["ent_coef_tensor"]
+
+        # FAST specific save parameters.
+        state_dicts.extend(["base_critic_value"])
+        state_dicts.extend([
+            "base_critic_value.critic.optimizer",
+            "base_critic_value.value_net.optimizer",
+        ])
         return state_dicts, saved_pytorch_variables
     
     def _sample_action(
@@ -574,14 +592,14 @@ class FAST(OffPolicyAlgorithm):
             if action_noise is not None:
                 random_action_dict['action_noise'] = action_noise
         # Setting residual scale based on residual scale schedule.
-        residual_scale = max(
-            (self.num_timesteps / self.residual_scale_schedule) * self.residual_scale, self.residual_scale
+        residual_mag = max(
+            (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
         )
         action_dict = self.get_combined_action(
             observation=self._last_obs,
             deterministic=False,
             random_action_dict=random_action_dict,
-            residual_scale=residual_scale,
+            residual_mag=residual_mag,
         )
         final_action = action_dict['final_action']
         buffer_action = final_action # Buffer action is the final combined action.
@@ -615,7 +633,7 @@ class FAST(OffPolicyAlgorithm):
             deterministic=deterministic,
             sample_base=sample_base,
             random_action_dict={},
-            residual_scale=self.residual_scale,
+            residual_mag=self.residual_mag,
         )
         return action_dict['final_action'], action_dict.get('predict_second_return', None)
 
@@ -636,14 +654,20 @@ class FAST(OffPolicyAlgorithm):
         # Sample action from fast policy.
         full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
         scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
-        scaled_action = th.clamp(scaled_action, -self.residual_scale, self.residual_scale)
+        # scaled_action = th.clamp(scaled_action, -self.residual_mag, self.residual_mag)
         
         # Combine base action and fast policy action.
-        if self.policy_type == 'residual':
-            # NOTE: this assumes action space is normalized to [-1, 1]
-            final_action = th.clamp(base_action + scaled_action, -1, 1)
+        if isinstance(self.policy, ResidualSACPolicy):
+            scaled_action, final_action = self.policy.get_final_action(
+                scaled_action, base_action, self.residual_mag, use_numpy=False
+            )
         else:
-            raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
+            raise NotImplementedError("Only ResidualSACPolicy is implemented for FAST.")
+        # if self.policy_type == 'residual':
+            # NOTE: this assumes action space is normalized to [-1, 1]
+        #     final_action = th.clamp(base_action + scaled_action, -1, 1)
+        # else:
+        #     raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
         
         # Add fast action and final action to return dict.
         return_dict['scaled_action'] = scaled_action
@@ -659,7 +683,7 @@ class FAST(OffPolicyAlgorithm):
             deterministic: bool = False,
             sample_base: bool = False,
             random_action_dict: dict = {},
-            residual_scale: float = 0.0,
+            residual_mag: float = 0.0,
     ) -> dict[str, np.ndarray]:
         return_dict = {}
         # First, sample action from base policy.
@@ -681,34 +705,44 @@ class FAST(OffPolicyAlgorithm):
         if random_action_dict:
             # If provided, sample random action for exploration.
             action_noise = random_action_dict.get('action_noise', None)
-            unscaled_action = np.array([self.action_space.sample() for _ in range(random_action_dict['n_envs'])])
+            # TODO: BUGFIX - THIS NEEDS TO SAPMLE FROM ACTOR ACTION SPACE
+            unscaled_action = np.array([self.actor.action_space.sample() for _ in range(random_action_dict['n_envs'])])
+            # unscaled_action = np.array([self.action_space.sample() for _ in range(random_action_dict['n_envs'])])
             if isinstance(self.action_space, spaces.Box):
-                scaled_action = self.policy.scale_action(unscaled_action)
+                # scaled_action = self.policy.scale_action(unscaled_action)
+                scaled_action = self.actor.scale_action(unscaled_action)
 
                 # Add noise to the action (improve exploration)
                 if action_noise is not None:
                     scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
                 
-                unscaled_action = self.policy.unscale_action(scaled_action)
+                unscaled_action = self.actor.unscale_action(scaled_action)
+                # unscaled_action = self.policy.unscale_action(scaled_action)
             else:
                 scaled_action = unscaled_action
         else:
             # Use predict() otherwise -this unsquashes, so re-scale if needed.
             full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
             unscaled_action, predict_second_return = self.predict(full_obs, state, episode_start, deterministic)
-            if isinstance(self.action_space, spaces.Box):
-                scaled_action = self.policy.scale_action(unscaled_action)
+            if isinstance(self.actor.action_space, spaces.Box):
+                scaled_action = self.actor.scale_action(unscaled_action)
             else:
                 scaled_action = unscaled_action
             return_dict['predict_second_return'] = predict_second_return
 
         # Combine base action and fast policy action.
-        if self.policy_type == 'residual':
-            scaled_action = np.clip(scaled_action, -residual_scale, residual_scale)
-            # NOTE: this assumes action space is normalized to [-1, 1]
-            final_action = np.clip(base_action + scaled_action, -1, 1)
+        if isinstance(self.policy, ResidualSACPolicy):
+            scaled_action, final_action = self.policy.get_final_action(
+                scaled_action, base_action, residual_mag, use_numpy=True
+            )
         else:
-            raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
+            raise NotImplementedError("Only ResidualSACPolicy is implemented for FAST.")
+        # if self.policy_type == 'residual':
+        #     scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
+        #     # NOTE: this assumes action space is normalized to [-1, 1]
+        #     final_action = np.clip(base_action + scaled_action, -1, 1)
+        # else:
+        #     raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
         # Add fast action and final action to return dict.
         return_dict['scaled_action'] = scaled_action
