@@ -288,7 +288,7 @@ class ResidualSACPolicy(SACPolicy):
         if self.policy_type == "residual":
             # For residual policy, default action space is fine.
             pass
-        elif self.policy_type == "residual_scale":
+        elif self.policy_type in ["residual_scale", "residual_force"]:
             # For residual + scale policy, add extra dimension to action space.
             actor_action_space = self.actor_kwargs["action_space"]
             self.actor_kwargs["action_space"] = spaces.Box(
@@ -297,7 +297,7 @@ class ResidualSACPolicy(SACPolicy):
                 dtype=actor_action_space.dtype,
             )
         else:
-            raise ValueError("policy_type must be in ['residual', 'residual_scale']")
+            raise ValueError("policy_type must be in ['residual', 'residual_scale', 'residual_force'].")
         # Calling parent _build() with updated actor kwargs.
         super()._build(lr_schedule)
 
@@ -383,7 +383,7 @@ class ResidualSACPolicy(SACPolicy):
                 scaled_action = th.clamp(scaled_action, -residual_mag, residual_mag)
                 final_action = th.clamp(base_action + scaled_action, -1.0, 1.0)
 
-        elif self.policy_type == "residual_scale":
+        elif self.policy_type in ["residual_scale", "residual_force"]:
             # NOTE: this assumes unscaled action space is centered at 0...
             # ... which is NOT true for orientation....
             # but for now we are only scaling delta xyz
@@ -398,6 +398,9 @@ class ResidualSACPolicy(SACPolicy):
                 scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
                 pred_residual = scaled_action[:, :self.chunk_size * self.act_dim]
                 pred_scale = scaled_action[:, -self.chunk_size:]
+                if self.policy_type == "residual_force":
+                    # Force scale to speed up.
+                    pred_scale = np.maximum(pred_scale, 0.1)
 
                 # Scaling finsal delta action.
                 final_action = (base_action + pred_residual).reshape(-1, self.chunk_size, self.act_dim)
@@ -410,6 +413,9 @@ class ResidualSACPolicy(SACPolicy):
                 scaled_action = th.clamp(scaled_action, -residual_mag, residual_mag)
                 pred_residual = scaled_action[:, :self.chunk_size * self.act_dim]
                 pred_scale = scaled_action[:, -self.chunk_size:]
+                if self.policy_type == "residual_force":
+                    # Force scale to speed up.
+                    pred_scale = th.maximum(pred_scale, th.tensor(0.1, device=pred_scale.device))
 
                 # Scaling finsal delta action.
                 final_action = (base_action + pred_residual).view(-1, self.chunk_size, self.act_dim)

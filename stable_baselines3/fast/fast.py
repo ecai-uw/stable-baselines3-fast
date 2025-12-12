@@ -262,7 +262,7 @@ class FAST(OffPolicyAlgorithm):
 
         # Overwrite model policy to create base-conditioned fast policy.
         # if self.policy_type != 'residual':
-        if self.policy_type not in ["residual", "residual_scale"]:
+        if self.policy_type not in ["residual", "residual_scale", "residual_force"]:
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
         # Creating new base policy to get base critic.
