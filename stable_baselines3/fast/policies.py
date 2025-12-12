@@ -382,6 +382,10 @@ class ResidualSACPolicy(SACPolicy):
             else:
                 scaled_action = th.clamp(scaled_action, -residual_mag, residual_mag)
                 final_action = th.clamp(base_action + scaled_action, -1.0, 1.0)
+            return {
+                "scaled_action": scaled_action,
+                "final_action": final_action,
+            }
 
         elif self.policy_type in ["residual_scale", "residual_force"]:
             # NOTE: this assumes unscaled action space is centered at 0...
@@ -392,7 +396,6 @@ class ResidualSACPolicy(SACPolicy):
             # zero_action = -action_min / (action_max - action_min) * 2 - 1
             # delta_action = np.array([0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
             # NOTE: THIS ASSUMES DELTA EEF ACTION SPACE
-
             if use_numpy:
                 # Clamp residuals and scales with the same bounds. TODO: separate?
                 scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
@@ -423,5 +426,11 @@ class ResidualSACPolicy(SACPolicy):
                 final_action[:, :, 0:3] *= th.pow(MAX_ACTION_SCALE, pred_scale) # only scale position
                 final_action = final_action.view(-1, self.chunk_size * self.act_dim)
                 final_action = th.clamp(final_action, -1.0, 1.0)
+            
+            return {
+                "scaled_action": scaled_action,
+                "final_action": final_action,
+                "predict_second_return": pred_scale,
+            }
         
         return scaled_action, final_action

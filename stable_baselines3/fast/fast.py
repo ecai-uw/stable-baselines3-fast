@@ -658,17 +658,14 @@ class FAST(OffPolicyAlgorithm):
         
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
-            scaled_action, final_action = self.policy.get_final_action(
+            final_action_dict = self.policy.get_final_action(
                 scaled_action, base_action, self.residual_mag, use_numpy=False
             )
+            scaled_action = final_action_dict["scaled_action"]
+            final_action = final_action_dict["final_action"]
         else:
             raise NotImplementedError("Only ResidualSACPolicy is implemented for FAST.")
-        # if self.policy_type == 'residual':
-            # NOTE: this assumes action space is normalized to [-1, 1]
-        #     final_action = th.clamp(base_action + scaled_action, -1, 1)
-        # else:
-        #     raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
-        
+
         # Add fast action and final action to return dict.
         return_dict['scaled_action'] = scaled_action
         return_dict['final_action'] = final_action
@@ -705,11 +702,8 @@ class FAST(OffPolicyAlgorithm):
         if random_action_dict:
             # If provided, sample random action for exploration.
             action_noise = random_action_dict.get('action_noise', None)
-            # TODO: BUGFIX - THIS NEEDS TO SAPMLE FROM ACTOR ACTION SPACE
             unscaled_action = np.array([self.actor.action_space.sample() for _ in range(random_action_dict['n_envs'])])
-            # unscaled_action = np.array([self.action_space.sample() for _ in range(random_action_dict['n_envs'])])
             if isinstance(self.action_space, spaces.Box):
-                # scaled_action = self.policy.scale_action(unscaled_action)
                 scaled_action = self.actor.scale_action(unscaled_action)
 
                 # Add noise to the action (improve exploration)
@@ -717,32 +711,28 @@ class FAST(OffPolicyAlgorithm):
                     scaled_action = np.clip(scaled_action + action_noise(), -1, 1)
                 
                 unscaled_action = self.actor.unscale_action(scaled_action)
-                # unscaled_action = self.policy.unscale_action(scaled_action)
             else:
                 scaled_action = unscaled_action
         else:
-            # Use predict() otherwise -this unsquashes, so re-scale if needed.
+            # Use predict() otherwise; this unsquashes, so re-scale if needed.
             full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
-            unscaled_action, predict_second_return = self.predict(full_obs, state, episode_start, deterministic)
+            unscaled_action, _ = self.predict(full_obs, state, episode_start, deterministic)
             if isinstance(self.actor.action_space, spaces.Box):
                 scaled_action = self.actor.scale_action(unscaled_action)
             else:
                 scaled_action = unscaled_action
-            return_dict['predict_second_return'] = predict_second_return
+            # return_dict['predict_second_return'] = predict_second_return
 
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
-            scaled_action, final_action = self.policy.get_final_action(
+            final_action_dict = self.policy.get_final_action(
                 scaled_action, base_action, residual_mag, use_numpy=True
             )
+            scaled_action = final_action_dict["scaled_action"]
+            final_action = final_action_dict["final_action"]
+            return_dict["predict_second_return"] = final_action_dict.get("predict_second_return", None)
         else:
             raise NotImplementedError("Only ResidualSACPolicy is implemented for FAST.")
-        # if self.policy_type == 'residual':
-        #     scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
-        #     # NOTE: this assumes action space is normalized to [-1, 1]
-        #     final_action = np.clip(base_action + scaled_action, -1, 1)
-        # else:
-        #     raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
         # Add fast action and final action to return dict.
         return_dict['scaled_action'] = scaled_action
