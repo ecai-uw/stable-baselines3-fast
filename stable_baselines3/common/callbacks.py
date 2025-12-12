@@ -282,6 +282,7 @@ class CheckpointCallback(BaseCallback):
         name_prefix: str = "rl_model",
         save_replay_buffer: bool = False,
         save_vecnormalize: bool = False,
+        only_last_buffer: bool = False,
         verbose: int = 0,
     ):
         super().__init__(verbose)
@@ -290,6 +291,7 @@ class CheckpointCallback(BaseCallback):
         self.name_prefix = name_prefix
         self.save_replay_buffer = save_replay_buffer
         self.save_vecnormalize = save_vecnormalize
+        self.only_last_buffer = only_last_buffer
 
     def _init_callback(self) -> None:
         # Create folder if needed
@@ -318,6 +320,13 @@ class CheckpointCallback(BaseCallback):
                 # If model has a replay buffer, save it too
                 replay_buffer_path = self._checkpoint_path("replay_buffer_", extension="pkl")
                 self.model.save_replay_buffer(replay_buffer_path)  # type: ignore[attr-defined]
+                if self.only_last_buffer:
+                    # Remove older replay buffer checkpoints
+                    for file in os.listdir(self.save_path):
+                        if file.startswith(f"{self.name_prefix}_replay_buffer_") and file != os.path.basename(
+                            replay_buffer_path
+                        ):
+                            os.remove(os.path.join(self.save_path, file))
                 if self.verbose > 1:
                     print(f"Saving model replay buffer checkpoint to {replay_buffer_path}")
 
