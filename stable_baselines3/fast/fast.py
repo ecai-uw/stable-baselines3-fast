@@ -129,6 +129,7 @@ class FAST(OffPolicyAlgorithm):
 		diffusion_act_dim=(1, 1),
         critic_backup_combine_type='min',
 		base_gamma: float = 0.995,
+        base_gradient_steps: int = -1,
         policy_action_condition: bool = False,
         shape_rewards: bool = False,
         cfg: dict = {},
@@ -169,6 +170,7 @@ class FAST(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
         self.actor_gradient_steps = actor_gradient_steps
+        self.base_gradient_steps = base_gradient_steps
 
         # TODO: clean up; abstract as many params as possible into this cfg
         self.cfg = cfg
@@ -262,7 +264,7 @@ class FAST(OffPolicyAlgorithm):
 
         # Overwrite model policy to create base-conditioned fast policy.
         # if self.policy_type != 'residual':
-        if self.policy_type not in ["residual", "residual_scale", "residual_force"]:
+        if self.policy_type not in ["residual", "residual_scale", "residual_force", "residual_scale2", "residual_force2"]:
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
         # Creating new base policy to get base critic.
@@ -312,6 +314,16 @@ class FAST(OffPolicyAlgorithm):
         else:
             actor_gradient_idx = np.linspace(int(gradient_steps / self.actor_gradient_steps) - 1, gradient_steps-1, self.actor_gradient_steps, dtype=int)
 
+        # Getting update steps for base critic/value.
+        if self.base_gradient_steps < 0:
+            base_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
+        # If 0, don't update base critic/value.
+        elif self.base_gradient_steps == 0:
+            base_gradient_idx = np.array([], dtype=int)
+        else:
+            base_gradient_idx = np.linspace(int(gradient_steps / self.base_gradient_steps) - 1, gradient_steps-1, self.base_gradient_steps, dtype=int)
+
+        # gradient steps should be set by utd.
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
@@ -403,6 +415,17 @@ class FAST(OffPolicyAlgorithm):
                 # Copy running stats, see GH issue #996
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
+            # Update base critic/value.
+            if gradient_step in base_gradient_idx and self.shape_rewards:
+                self.train_base_value(
+                    fqe_steps=1,
+                    vd_steps=1,
+                    batch_size=batch_size,
+                    vd_samples=self.cfg.base.vd_samples,
+                    pre_train=False,
+                    replay_data=replay_data,
+                )
+
         self._n_updates += gradient_steps
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
@@ -412,7 +435,15 @@ class FAST(OffPolicyAlgorithm):
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
 
-    def train_base_value(self, fqe_steps: int, vd_steps: int, batch_size: int = 64, vd_samples: int = 16) -> None:
+    def train_base_value(
+        self, 
+        fqe_steps: int, 
+        vd_steps: int, 
+        batch_size: int = 64, 
+        vd_samples: int = 16,
+        pre_train: bool = False,
+        replay_data: Optional[Any] = None,
+    ) -> None:
         """
         Run Fitted Q Evaluation (FQE) to train the base (slow) critic, then distill
         into the base value function (VD). NOTE: this function does not unscale actions, but it shouldn't 
@@ -441,13 +472,19 @@ class FAST(OffPolicyAlgorithm):
         # Switch to train mode.
         self.base_critic_value.critic.set_training_mode(True)
         # Create learning rate scheduler.
-        lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.critic.optimizer, T_max=fqe_steps)
+        if pre_train:
+            # If pretraining, use cosine annealing lr schedule.
+            lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.critic.optimizer, T_max=fqe_steps)
+        else:
+            # Otherwise, use constant lr.
+            lr_scheduler = th.optim.lr_scheduler.LambdaLR(self.base_critic_value.critic.optimizer, lr_lambda=lambda step: 1.0)
 
-        # for step in tqdm(range(total_steps)):
-        with tqdm(range(fqe_steps)) as pbar:
+        # Update base critic; only show progress bar if pre-training.
+        with tqdm(range(fqe_steps), disable=not pre_train) as pbar:
             for step in pbar:
-                # Sample replay buffer.
-                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+                # If replay data is not provided (pre-training), sample from replay buffer.
+                if replay_data is None:
+                    replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
                 # observations, actions, next_observations, dones, rewards
 
                 with th.no_grad():
@@ -493,11 +530,18 @@ class FAST(OffPolicyAlgorithm):
 
         # Now, distill base critic into base value function.
         self.base_critic_value.value_net.set_training_mode(True)
-        value_lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.value_net.optimizer, T_max=vd_steps)
-        with tqdm(range(vd_steps)) as pbar:
+        # Create learning rate scheduler.
+        if pre_train:
+            value_lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.value_net.optimizer, T_max=vd_steps)
+        else:
+            value_lr_scheduler = th.optim.lr_scheduler.LambdaLR(self.base_critic_value.value_net.optimizer, lr_lambda=lambda step: 1.0)
+        
+        # Update base value function; only show progress bar if pre-training.
+        with tqdm(range(vd_steps), disable=not pre_train) as pbar:
             for step in pbar:
-                # Sample replay buffer.
-                replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+                # If replay data is not provided (pre-training), sample from replay buffer.
+                if replay_data is None:
+                    replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
 
                 with th.no_grad():
                     # Sample actions from base diffusion policy.
