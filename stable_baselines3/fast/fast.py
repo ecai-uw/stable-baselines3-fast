@@ -129,9 +129,9 @@ class FAST(OffPolicyAlgorithm):
 		diffusion_act_dim=(1, 1),
         critic_backup_combine_type='min',
 		base_gamma: float = 0.995,
-        base_gradient_steps: int = -1,
-        policy_action_condition: bool = False,
-        shape_rewards: bool = False,
+        # base_gradient_steps: int = -1,
+        # policy_action_condition: bool = False,
+        # shape_rewards: bool = False,
         cfg: dict = {},
 	):
         super().__init__(
@@ -170,7 +170,6 @@ class FAST(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
         self.actor_gradient_steps = actor_gradient_steps
-        self.base_gradient_steps = base_gradient_steps
 
         # TODO: clean up; abstract as many params as possible into this cfg
         self.cfg = cfg
@@ -181,9 +180,6 @@ class FAST(OffPolicyAlgorithm):
         self.critic_backup_combine_type = critic_backup_combine_type
         self.base_gamma = base_gamma
         self.base_kwargs = base_kwargs
-        # self.policy_type = policy_type
-        self.policy_action_condition = policy_action_condition
-        self.shape_rewards = shape_rewards
 
 
         if _init_setup_model:
@@ -192,9 +188,17 @@ class FAST(OffPolicyAlgorithm):
     def _setup_model(self) -> None:
         # Extracting base policy config params.
         self.policy_type = self.cfg.policy.type
+        self.policy_impedance_mode = self.cfg.policy.impedance_mode
+        self.policy_action_condition = self.cfg.policy.action_condition
+        self.shape_rewards = self.cfg.policy.shape_rewards
+        self.base_gradient_steps = self.cfg.policy.base_gradient_steps
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
         self.drop_velocity = self.cfg.policy.drop_velocity
+
+        # Extracting controller params.
+        self.controller_configs = self.cfg.controller
+        assert self.policy_impedance_mode == self.controller_configs.impedance_mode, "Controller impedance mode in cfg.controller must match cfg.policy.impedance_mode"
 
         # Observation meta for processing observations.
         self.observation_meta = self.cfg.env.observation_meta
@@ -206,11 +210,11 @@ class FAST(OffPolicyAlgorithm):
         if self.policy_action_condition:
             self.policy_class = partial(
                 ResidualSACPolicy, 
-                policy_type=self.policy_type, 
+                policy_type=self.policy_type,
+                impedance_mode=self.policy_impedance_mode,
                 chunk_size=self.diffusion_act_chunk,
                 act_dim=self.diffusion_act_dim,
             )
-            # self.policy_class = ResidualSACPolicy # this will need to create the residual actor internally
 
         # Processing observation meta.
         if self.drop_velocity:
@@ -498,6 +502,10 @@ class FAST(OffPolicyAlgorithm):
                     next_actions = self.diffusion_policy(replay_data.next_observations, next_noise, return_numpy=False)
                     next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 
+                    # Augmenting base policy actions depending on impedance mode.
+                    if self.policy_impedance_mode != "fixed":
+                        next_actions = self.augment_controller_action(next_actions, is_numpy=False)
+
                     # Compute next Q values using base critic target.
                     next_q_values = th.cat(self.base_critic_value.forward_qt(replay_data.next_observations, next_actions), dim=1)
                     if self.critic_backup_combine_type == 'min':
@@ -549,6 +557,9 @@ class FAST(OffPolicyAlgorithm):
                     obs = replay_data.observations.unsqueeze(1).expand(-1, vd_samples, -1).reshape(batch_size * vd_samples, -1)
                     actions = self.diffusion_policy(obs, noise, return_numpy=False)
                     actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+                    # Augmenting base policy actions depending on impedance mode.
+                    if self.policy_impedance_mode != "fixed":
+                        actions = self.augment_controller_action(actions, is_numpy=False)
                     
                     # Compute Q values using base critic; average across critics and across vd_samples.
                     mean_q_values = th.cat(self.base_critic_value.forward_q(obs, actions), dim=1).mean(dim=1, keepdim=True)
@@ -694,11 +705,13 @@ class FAST(OffPolicyAlgorithm):
         noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
         base_action = self.diffusion_policy(observation, noise, return_numpy=False)
         base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+        # Depending on impedance mode, augmenting base action based on controller config.
+        if self.policy_impedance_mode != "fixed":
+            base_action = self.augment_controller_action(base_action, is_numpy=False)
 
         # Sample action from fast policy.
         full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
         scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
-        # scaled_action = th.clamp(scaled_action, -self.residual_mag, self.residual_mag)
         
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
@@ -735,6 +748,9 @@ class FAST(OffPolicyAlgorithm):
             return_numpy=True,
         )
         base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+        # Depending on impedance mode, augmenting base action based on controller config.
+        if self.policy_impedance_mode != "fixed":
+            base_action = self.augment_controller_action(base_action, is_numpy=True)
         return_dict['base_action'] = base_action
 
         # If sample_base is True, return only the base action as the final action.
@@ -790,14 +806,56 @@ class FAST(OffPolicyAlgorithm):
         For clarity, should type replay_data argument: dict or ReplayBufferSamples?
         """
         if self.shape_rewards:
-            rewards = replay_data.rewards + \
-                  self.gamma * self.base_critic_value.forward_v(replay_data.next_observations).detach() - \
-                  self.base_critic_value.forward_v(replay_data.observations).detach()
+            # rewards = replay_data.rewards + \
+            #       self.gamma * self.base_critic_value.forward_v(replay_data.next_observations).detach() - \
+            #       self.base_critic_value.forward_v(replay_data.observations).detach()
+            rewards = replay_data.rewards + self.get_shaped_rewards(replay_data.observations, replay_data.next_observations)
         else:
             rewards = replay_data.rewards
         return rewards
-    
+
     def get_shaped_rewards(self, obs, next_obs):
         # TODO: get_rewards function should directly call this function
-        return self.gamma * self.base_critic_value.forward_v(next_obs).detach() - \
-                self.base_critic_value.forward_v(obs).detach()
+        obs_delta = th.linalg.norm(next_obs - obs, dim=1, keepdim=True)
+        obs_delta = th.clamp(obs_delta, max=0.05)
+        return obs_delta
+        # return self.gamma * self.base_critic_value.forward_v(next_obs).detach() - \
+        #         self.base_critic_value.forward_v(obs).detach()
+    
+    def augment_controller_action(self, action, is_numpy: bool = True):
+        """
+        Helper function to augment action with impedance parameters based on controller config. This does nothing if 
+        impedance mode is fixed, so it can always be called. The input action should be an action-chunked, OSC 
+        action (i.e. chunk_size * act_dim).
+
+        Note: the default control params are assumed to be 0 in the normalized/scaled action space.
+        """
+        if self.policy_impedance_mode == "fixed":
+            return action
+
+        # Action shape should be (n_envs, chunk_size * act_dim)
+        n_actions = action.shape[0]
+        action = action.reshape(n_actions, self.diffusion_act_chunk, self.diffusion_act_dim)
+        # Creating stiffness action, since it's required for both variable and variable_kp modes.
+        if is_numpy:
+            stiffness_action = np.zeros((n_actions, self.diffusion_act_chunk, 1), dtype=np.float32)
+        else:
+            stiffness_action = th.zeros((n_actions, self.diffusion_act_chunk, 1), device=action.device, dtype=th.float32)
+
+        # Creating damping action, if necessary.
+        if self.policy_impedance_mode == "variable":
+            if is_numpy:
+                damping_action = np.zeros((n_actions, self.diffusion_act_chunk, 1), dtype=np.float32)
+                action = np.concatenate([damping_action, stiffness_action, action], axis=-1)
+            else:
+                damping_action = th.zeros((n_actions, self.diffusion_act_chunk, 1), device=action.device, dtype=th.float32)
+                action = th.cat([damping_action, stiffness_action, action], dim=-1)
+            action = action.reshape(n_actions, self.diffusion_act_chunk * (self.diffusion_act_dim + 2))
+        elif self.policy_impedance_mode == "variable_kp":
+            if is_numpy:
+                action = np.concatenate([stiffness_action, action], axis=-1)
+            else:
+                action = th.cat([stiffness_action, action], dim=-1)
+            action = action.reshape(n_actions, self.diffusion_act_chunk * (self.diffusion_act_dim + 1))
+
+        return action

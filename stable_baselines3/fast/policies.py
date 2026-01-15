@@ -253,12 +253,14 @@ class ResidualSACPolicy(SACPolicy):
         post_linear_modules: Optional[list[type[nn.Module]]] = None,
         standard_gauss_init: bool = False,
         policy_type: str = "residual",
+        impedance_mode: str = "fixed",
         chunk_size: int = 1,
         act_dim: int = 1,
     ):
         self.policy_type = policy_type
         self.chunk_size = chunk_size
         self.act_dim = act_dim
+        self.impedance_mode = impedance_mode
         super().__init__(
             observation_space,
             action_space,
@@ -373,6 +375,9 @@ class ResidualSACPolicy(SACPolicy):
         residual_mag: float,
         use_numpy: bool = True,
     ):
+        # TODO: DON'T CLAMP THE CONTROL PARAMS
+        # TODO: FOR EFFICIENCY, ONLY AUGMENT BASE ACTIONS IF WE'RE NOT SAMPLIGN HTE RESIDUAL POLICY
+        # TOOD: in other words, functions in fast.py should check if sample_base=True; if it is, then call augment...
         # Scale action (clip residuals based on residual magnitude).
         if self.policy_type == "residual":
             # NOTE: this assumes action space is normalized to [-1, 1]
