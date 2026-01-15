@@ -647,7 +647,7 @@ class FAST(OffPolicyAlgorithm):
             if action_noise is not None:
                 random_action_dict['action_noise'] = action_noise
         # Setting residual scale based on residual scale schedule.
-        residual_mag = max(
+        residual_mag = min(
             (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
         )
         action_dict = self.get_combined_action(
@@ -681,6 +681,10 @@ class FAST(OffPolicyAlgorithm):
         :return: the model's action and the next hidden state
             (used in recurrent policies)
         """
+        # Setting residual scale based on residual scale schedule.
+        residual_mag = min(
+            (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
+        )
         action_dict = self.get_combined_action(
             observation=observation,
             state=state,
@@ -688,7 +692,7 @@ class FAST(OffPolicyAlgorithm):
             deterministic=deterministic,
             sample_base=sample_base,
             random_action_dict={},
-            residual_mag=self.residual_mag,
+            residual_mag=residual_mag,
         )
         return action_dict['final_action'], action_dict.get('predict_second_return', None)
 
@@ -715,8 +719,12 @@ class FAST(OffPolicyAlgorithm):
         
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
+            # Setting residual scale based on residual scale schedule.
+            residual_mag = min(
+            (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
+        )
             final_action_dict = self.policy.get_final_action(
-                scaled_action, base_action, self.residual_mag, use_numpy=False
+                scaled_action, base_action, residual_mag, use_numpy=False
             )
             scaled_action = final_action_dict["scaled_action"]
             final_action = final_action_dict["final_action"]
