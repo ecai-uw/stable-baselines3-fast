@@ -189,6 +189,7 @@ class FAST(OffPolicyAlgorithm):
         # Extracting base policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
+        self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
         self.policy_action_condition = self.cfg.policy.action_condition
         self.shape_rewards = self.cfg.policy.shape_rewards
         self.base_gradient_steps = self.cfg.policy.base_gradient_steps
@@ -197,6 +198,7 @@ class FAST(OffPolicyAlgorithm):
         self.drop_velocity = self.cfg.policy.drop_velocity
 
         # Extracting controller params.
+        self.control_obs = self.cfg.env.control_obs
         self.controller_configs = self.cfg.controller
         assert self.policy_impedance_mode == self.controller_configs.impedance_mode, "Controller impedance mode in cfg.controller must match cfg.policy.impedance_mode"
 
@@ -312,6 +314,7 @@ class FAST(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
+        final_actor_losses, smooth_gain_losses = [], []
 
         if self.actor_gradient_steps < 0:
             actor_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
@@ -406,11 +409,22 @@ class FAST(OffPolicyAlgorithm):
                 elif self.critic_backup_combine_type == 'mean':
                     min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
                 actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
+
+                # TODO: add smoothing loss to control parameters, if necessary.
+                if self.policy_smooth_gain_lambda > 0.0 and self.policy_impedance_mode != "fixed":
+                    smooth_gain_loss = self.policy.get_smooth_gain_loss(actions_pi, self.policy_smooth_gain_lambda)
+                    final_actor_loss = actor_loss + smooth_gain_loss
+                    smooth_gain_losses.append(smooth_gain_loss.item())
+                else:
+                    final_actor_loss = actor_loss
+
                 actor_losses.append(actor_loss.item())
+                final_actor_losses.append(final_actor_loss.item())
 
                 # Optimize the actor
                 self.actor.optimizer.zero_grad()
-                actor_loss.backward()
+                # actor_loss.backward()
+                final_actor_loss.backward()
                 self.actor.optimizer.step()
             
             # Update target networks
@@ -435,6 +449,9 @@ class FAST(OffPolicyAlgorithm):
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
+        self.logger.record("train/final_actor_loss", np.mean(final_actor_losses))
+        if len(smooth_gain_losses) > 0:
+            self.logger.record("train/smooth_gain_loss", np.mean(smooth_gain_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
@@ -493,18 +510,20 @@ class FAST(OffPolicyAlgorithm):
 
                 with th.no_grad():
                     # Sample actions from base diffusion policy.
-                    noise = th.randn((batch_size, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-                    actions = self.diffusion_policy(replay_data.observations, noise, return_numpy=False)
-                    actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+                    # noise = th.randn((batch_size, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+                    # actions = self.diffusion_policy(replay_data.observations, noise, return_numpy=False)
+                    # actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 
                     # Sample next actions from base diffusion policy.
-                    next_noise = th.randn((batch_size, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-                    next_actions = self.diffusion_policy(replay_data.next_observations, next_noise, return_numpy=False)
-                    next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+                    # next_noise = th.randn((batch_size, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+                    # next_actions = self.diffusion_policy(replay_data.next_observations, next_noise, return_numpy=False)
+                    # next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
 
-                    # Augmenting base policy actions depending on impedance mode.
-                    if self.policy_impedance_mode != "fixed":
-                        next_actions = self.augment_controller_action(next_actions, is_numpy=False)
+                    next_actions = self.sample_base_policy(replay_data.next_observations, return_numpy=False)
+
+                    # # Augmenting base policy actions depending on impedance mode.
+                    # if self.policy_impedance_mode != "fixed":
+                    #     next_actions = self.augment_controller_action(next_actions, is_numpy=False)
 
                     # Compute next Q values using base critic target.
                     next_q_values = th.cat(self.base_critic_value.forward_qt(replay_data.next_observations, next_actions), dim=1)
@@ -553,13 +572,14 @@ class FAST(OffPolicyAlgorithm):
 
                 with th.no_grad():
                     # Sample actions from base diffusion policy.
-                    noise = th.randn((batch_size * vd_samples, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+                    # noise = th.randn((batch_size * vd_samples, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
                     obs = replay_data.observations.unsqueeze(1).expand(-1, vd_samples, -1).reshape(batch_size * vd_samples, -1)
-                    actions = self.diffusion_policy(obs, noise, return_numpy=False)
-                    actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-                    # Augmenting base policy actions depending on impedance mode.
-                    if self.policy_impedance_mode != "fixed":
-                        actions = self.augment_controller_action(actions, is_numpy=False)
+                    # actions = self.diffusion_policy(obs, noise, return_numpy=False)
+                    # actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+                    # # Augmenting base policy actions depending on impedance mode.
+                    # if self.policy_impedance_mode != "fixed":
+                    #     actions = self.augment_controller_action(actions, is_numpy=False)
+                    actions = self.sample_base_policy(obs, return_numpy=False)
                     
                     # Compute Q values using base critic; average across critics and across vd_samples.
                     mean_q_values = th.cat(self.base_critic_value.forward_q(obs, actions), dim=1).mean(dim=1, keepdim=True)
@@ -706,12 +726,13 @@ class FAST(OffPolicyAlgorithm):
         """
         return_dict = {}
         # First, sample action from base policy.
-        noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-        base_action = self.diffusion_policy(observation, noise, return_numpy=False)
-        base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-        # Depending on impedance mode, augmenting base action based on controller config.
-        if self.policy_impedance_mode != "fixed":
-            base_action = self.augment_controller_action(base_action, is_numpy=False)
+        base_action = self.sample_base_policy(observation, return_numpy=False)
+        # noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+        # base_action = self.diffusion_policy(observation, noise, return_numpy=False)
+        # base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+        # # Depending on impedance mode, augmenting base action based on controller config.
+        # if self.policy_impedance_mode != "fixed":
+        #     base_action = self.augment_controller_action(base_action, is_numpy=False)
 
         # Sample action from fast policy.
         full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
@@ -748,17 +769,23 @@ class FAST(OffPolicyAlgorithm):
             residual_mag: float = 0.0,
     ) -> dict[str, np.ndarray]:
         return_dict = {}
+
+
         # First, sample action from base policy.
-        noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-        base_action = self.diffusion_policy(
-            th.as_tensor(observation, device=self.device, dtype=th.float32), 
-            noise, 
-            return_numpy=True,
-        )
-        base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-        # Depending on impedance mode, augmenting base action based on controller config.
-        if self.policy_impedance_mode != "fixed":
-            base_action = self.augment_controller_action(base_action, is_numpy=True)
+        base_action = self.sample_base_policy(observation, return_numpy=True)
+        # breakpoint()
+
+        # # First, sample action from base policy.
+        # noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+        # base_action = self.diffusion_policy(
+        #     th.as_tensor(observation, device=self.device, dtype=th.float32), 
+        #     noise, 
+        #     return_numpy=True,
+        # )
+        # base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+        # # Depending on impedance mode, augmenting base action based on controller config.
+        # if self.policy_impedance_mode != "fixed":
+        #     base_action = self.augment_controller_action(base_action, is_numpy=True)
         return_dict['base_action'] = base_action
 
         # If sample_base is True, return only the base action as the final action.
@@ -809,6 +836,29 @@ class FAST(OffPolicyAlgorithm):
 
         return return_dict
     
+    def sample_base_policy(
+        self, 
+        observation: Union[np.ndarray, th.Tensor], 
+        return_numpy: bool,
+    ) -> Union[np.ndarray, th.Tensor]:
+        """
+        Helper function to sample action from base diffusion policy only.
+        """
+        # Remove controller params from environment observation for diffusion policy, if necessary.
+        base_observation = observation[..., :-2] if self.control_obs else observation
+        noise = th.randn((base_observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+        if isinstance(base_observation, np.ndarray):
+            base_observation_tensor = th.as_tensor(base_observation, device=self.device, dtype=th.float32)
+        else:
+            base_observation_tensor = base_observation
+        base_action = self.diffusion_policy(base_observation_tensor, noise, return_numpy=return_numpy)
+        base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
+        # Depending on impedance mode, augmenting base action based on controller config.
+        if self.policy_impedance_mode != "fixed":
+            base_action = self.augment_controller_action(base_action, is_numpy=return_numpy)
+        return base_action
+        
+
     def get_rewards(self, replay_data):
         """
         For clarity, should type replay_data argument: dict or ReplayBufferSamples?

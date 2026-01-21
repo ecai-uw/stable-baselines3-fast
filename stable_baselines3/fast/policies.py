@@ -479,3 +479,9 @@ class ResidualSACPolicy(SACPolicy):
             }
 
         return scaled_action, final_action
+
+    def get_smooth_gain_loss(self, actions, smooth_gain_lambda):
+        chunked_gains = actions.view(actions.shape[0], self.chunk_size, -1)[..., :2]  # assuming gains are first 2 dims
+        smoothness_loss = chunked_gains[:, 0:-2, :] - 2 * chunked_gains[:, 1:-1, :] + chunked_gains[:, 2:, :]
+        smoothness_loss = smooth_gain_lambda * th.mean(smoothness_loss ** 2)
+        return smoothness_loss
