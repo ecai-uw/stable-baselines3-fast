@@ -254,13 +254,28 @@ class ResidualSACPolicy(SACPolicy):
         standard_gauss_init: bool = False,
         policy_type: str = "residual",
         impedance_mode: str = "fixed",
-        chunk_size: int = 1,
-        act_dim: int = 1,
+        gains_only: bool = False,
+        residual_mag: float = 0.2,
+        gains_mag: float = 0.2,
+        chunk_size: int = 1, # TODO: rename this to diffusion_chunk_size
+        diffusion_act_dim: int = 1, # TODO: rename this to diffusion_act_dim
     ):
         self.policy_type = policy_type
         self.chunk_size = chunk_size
-        self.act_dim = act_dim
+        self.diffusion_act_dim = diffusion_act_dim
         self.impedance_mode = impedance_mode
+        self.gains_only = gains_only
+        self.residual_mag = residual_mag
+        self.gains_mag = gains_mag
+
+        # Getting true action dimension based on impedance mode.
+        if self.impedance_mode == "fixed":
+            self.act_dim = self.diffusion_act_dim
+        elif self.impedance_mode == "variable":
+            self.act_dim = self.diffusion_act_dim + 2
+        else:
+            raise ValueError("impedance_mode must be in ['fixed', 'variable'].")
+
         super().__init__(
             observation_space,
             action_space,
@@ -370,11 +385,64 @@ class ResidualSACPolicy(SACPolicy):
 
     def get_final_action(
         self,
-        scaled_action: np.ndarray,
-        base_action: np.ndarray,
-        residual_mag: float,
+        scaled_action: Union[np.ndarray, th.Tensor],
+        base_action: Union[np.ndarray, th.Tensor],
+        residual_mag_scale: float = 1.0,
         use_numpy: bool = True,
     ):
+        # Temporarily re-shaping residual action for processing.
+        scaled_action = scaled_action.reshape(-1, self.chunk_size, self.act_dim)
+
+        # If gains only, zero out residual for delta position and orientation.
+        if self.gains_only and self.impedance_mode != "fixed":
+            if use_numpy:
+                scaled_action[..., 2:] *= 0.0
+            else:
+                # if using torch, preserve gradient
+                mask = th.ones_like(scaled_action)
+                mask[..., 2:] = 0.0
+                scaled_action = scaled_action * mask
+
+        # Scaling/clamping gains and residuals separately.
+        residual_bounds = residual_mag_scale * self.residual_mag
+        gains_bounds = residual_mag_scale * self.gains_mag
+        if use_numpy:
+            scaled_action[..., :2] = np.clip(scaled_action[..., :2], -gains_bounds, gains_bounds)
+            scaled_action[..., 2:] = np.clip(scaled_action[..., 2:], -residual_bounds, residual_bounds)
+        else:
+            action_gains_clamped = th.clamp(scaled_action[..., :2], -gains_bounds, gains_bounds)
+            action_residual_clamped = th.clamp(scaled_action[..., 2:], -residual_bounds, residual_bounds)
+            scaled_action = th.cat([action_gains_clamped, action_residual_clamped], dim=-1)
+
+        # Re-shape actions back.
+        scaled_action = scaled_action.reshape(-1, self.chunk_size * self.act_dim)
+
+        if self.policy_type == "residual":
+            # NOTE: this assumes action space is normalized to [-1, 1]
+            if use_numpy:
+                final_action = np.clip(base_action + scaled_action, -1.0, 1.0)
+            else:
+                final_action = th.clamp(base_action + scaled_action, -1.0, 1.0)
+            return {
+                "scaled_action": scaled_action,
+                "final_action": final_action,
+            }
+        else:
+            raise NotImplementedError()
+
+        breakpoint()
+        # If gains only, zero out residual for delta position and orientation.
+        if self.gains_only and self.impedance_mode != "fixed":
+            scaled_action = scaled_action.reshape(-1, self.chunk_size, self.act_dim + 2)
+            # if using torch, preserve gradient
+            if not use_numpy:
+                mask = th.ones_like(scaled_action)
+                mask[..., 2:] = 0.0
+                scaled_action = scaled_action * mask
+            # Other wise, just modify in-place
+            else:
+                scaled_action[..., 2:] *= 0.0
+            scaled_action = scaled_action.reshape(-1, self.chunk_size * (self.act_dim + 2))
         # TODO: DON'T CLAMP THE CONTROL PARAMS
         # TODO: FOR EFFICIENCY, ONLY AUGMENT BASE ACTIONS IF WE'RE NOT SAMPLIGN HTE RESIDUAL POLICY
         # TOOD: in other words, functions in fast.py should check if sample_base=True; if it is, then call augment...
@@ -393,6 +461,7 @@ class ResidualSACPolicy(SACPolicy):
             }
 
         elif self.policy_type in ["residual_scale", "residual_force"]:
+            raise NotImplementedError()
             # NOTE: this assumes unscaled action space is centered at 0...
             # ... which is NOT true for orientation....
             # but for now we are only scaling delta xyz
@@ -479,9 +548,3 @@ class ResidualSACPolicy(SACPolicy):
             }
 
         return scaled_action, final_action
-
-    def get_smooth_gain_loss(self, actions, smooth_gain_lambda):
-        chunked_gains = actions.view(actions.shape[0], self.chunk_size, -1)[..., :2]  # assuming gains are first 2 dims
-        smoothness_loss = chunked_gains[:, 0:-2, :] - 2 * chunked_gains[:, 1:-1, :] + chunked_gains[:, 2:, :]
-        smoothness_loss = smooth_gain_lambda * th.mean(smoothness_loss ** 2)
-        return smoothness_loss

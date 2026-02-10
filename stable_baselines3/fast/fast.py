@@ -189,12 +189,14 @@ class FAST(OffPolicyAlgorithm):
         # Extracting base policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
+        self.policy_gains_only = self.cfg.policy.gains_only
         self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
         self.policy_action_condition = self.cfg.policy.action_condition
         self.shape_rewards = self.cfg.policy.shape_rewards
         self.base_gradient_steps = self.cfg.policy.base_gradient_steps
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
+        self.gains_mag = self.cfg.policy.gains_mag
         self.drop_velocity = self.cfg.policy.drop_velocity
 
         # Extracting controller params.
@@ -214,8 +216,11 @@ class FAST(OffPolicyAlgorithm):
                 ResidualSACPolicy, 
                 policy_type=self.policy_type,
                 impedance_mode=self.policy_impedance_mode,
+                gains_only=self.policy_gains_only,
+                residual_mag=self.residual_mag,
+                gains_mag=self.gains_mag,
                 chunk_size=self.diffusion_act_chunk,
-                act_dim=self.diffusion_act_dim,
+                diffusion_act_dim=self.diffusion_act_dim,
             )
 
         # Processing observation meta.
@@ -409,24 +414,44 @@ class FAST(OffPolicyAlgorithm):
                 elif self.critic_backup_combine_type == 'mean':
                     min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
                 actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
-
-                # TODO: add smoothing loss to control parameters, if necessary.
-                if self.policy_smooth_gain_lambda > 0.0 and self.policy_impedance_mode != "fixed":
-                    smooth_gain_loss = self.policy.get_smooth_gain_loss(actions_pi, self.policy_smooth_gain_lambda)
-                    final_actor_loss = actor_loss + smooth_gain_loss
-                    smooth_gain_losses.append(smooth_gain_loss.item())
-                else:
-                    final_actor_loss = actor_loss
-
                 actor_losses.append(actor_loss.item())
-                final_actor_losses.append(final_actor_loss.item())
 
-                # Optimize the actor
-                self.actor.optimizer.zero_grad()
-                # actor_loss.backward()
-                final_actor_loss.backward()
-                self.actor.optimizer.step()
-            
+                # TODO: MAYBE APPLY SCHEDULE FOR SMOOTH GAIN LAMBDA?
+                if self.policy_smooth_gain_lambda > 0.0 and self.policy_impedance_mode != "fixed":
+                    smooth_gain_loss = self.smooth_gain_loss(actions_pi, replay_data.observations, self.policy_smooth_gain_lambda)
+                    smooth_gain_losses.append(smooth_gain_loss.item())
+    
+                    # Debugging gradients; only for first gradient step.
+                    if self.cfg.debug_gradients and gradient_step == 0:
+                        # Backup original actor loss for logging
+                        self.actor.optimizer.zero_grad()
+                        actor_loss.backward(retain_graph=True)
+                        grad_norm_actor = th.zeros((), device=self.device)
+                        for p in self.actor.parameters():
+                            if p.grad is not None:
+                                grad_norm_actor += p.grad.norm().item() ** 2
+                        self.logger.record("debug/actor_grad_norm", grad_norm_actor)
+                        # Backup smoothness gain loss for logging
+                        self.actor.optimizer.zero_grad()
+                        smooth_gain_loss.backward(retain_graph=True)
+                        grad_norm_smooth = th.zeros((), device=self.device)
+                        for p in self.actor.parameters():
+                            if p.grad is not None:
+                                grad_norm_smooth += p.grad.norm().item() ** 2
+                        grad_norm_smooth = th.sqrt(grad_norm_smooth)
+                        self.logger.record("debug/smooth_gain_grad_norm", grad_norm_smooth)
+                    else:
+                        # Optimize the actor with combined loss.
+                        final_actor_loss = actor_loss + smooth_gain_loss
+                        self.actor.optimizer.zero_grad()
+                        final_actor_loss.backward()
+                    self.actor.optimizer.step()
+                else:
+                    # Optimize the actor with actor loss only.
+                    self.actor.optimizer.zero_grad()
+                    actor_loss.backward()
+                    self.actor.optimizer.step()
+
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
@@ -449,7 +474,6 @@ class FAST(OffPolicyAlgorithm):
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
-        self.logger.record("train/final_actor_loss", np.mean(final_actor_losses))
         if len(smooth_gain_losses) > 0:
             self.logger.record("train/smooth_gain_loss", np.mean(smooth_gain_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
@@ -667,9 +691,10 @@ class FAST(OffPolicyAlgorithm):
             if action_noise is not None:
                 random_action_dict['action_noise'] = action_noise
         # Setting residual scale based on residual scale schedule.
-        residual_mag = min(
-            (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
-        )
+        # residual_mag = min(
+        #     (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
+        # )
+        residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
         action_dict = self.get_combined_action(
             observation=self._last_obs,
             deterministic=False,
@@ -702,9 +727,10 @@ class FAST(OffPolicyAlgorithm):
             (used in recurrent policies)
         """
         # Setting residual scale based on residual scale schedule.
-        residual_mag = min(
-            (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
-        )
+        # residual_mag = min(
+        #     (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
+        # )
+        residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
         action_dict = self.get_combined_action(
             observation=observation,
             state=state,
@@ -727,12 +753,6 @@ class FAST(OffPolicyAlgorithm):
         return_dict = {}
         # First, sample action from base policy.
         base_action = self.sample_base_policy(observation, return_numpy=False)
-        # noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-        # base_action = self.diffusion_policy(observation, noise, return_numpy=False)
-        # base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-        # # Depending on impedance mode, augmenting base action based on controller config.
-        # if self.policy_impedance_mode != "fixed":
-        #     base_action = self.augment_controller_action(base_action, is_numpy=False)
 
         # Sample action from fast policy.
         full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
@@ -741,9 +761,10 @@ class FAST(OffPolicyAlgorithm):
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
             # Setting residual scale based on residual scale schedule.
-            residual_mag = min(
-            (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
-        )
+            # residual_mag = min(
+            #     (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
+            # )
+            residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
             final_action_dict = self.policy.get_final_action(
                 scaled_action, base_action, residual_mag, use_numpy=False
             )
@@ -766,26 +787,13 @@ class FAST(OffPolicyAlgorithm):
             deterministic: bool = False,
             sample_base: bool = False,
             random_action_dict: dict = {},
-            residual_mag: float = 0.0,
+            residual_mag: float = 1.0,
     ) -> dict[str, np.ndarray]:
         return_dict = {}
 
 
         # First, sample action from base policy.
         base_action = self.sample_base_policy(observation, return_numpy=True)
-        # breakpoint()
-
-        # # First, sample action from base policy.
-        # noise = th.randn((observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-        # base_action = self.diffusion_policy(
-        #     th.as_tensor(observation, device=self.device, dtype=th.float32), 
-        #     noise, 
-        #     return_numpy=True,
-        # )
-        # base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-        # # Depending on impedance mode, augmenting base action based on controller config.
-        # if self.policy_impedance_mode != "fixed":
-        #     base_action = self.augment_controller_action(base_action, is_numpy=True)
         return_dict['base_action'] = base_action
 
         # If sample_base is True, return only the base action as the final action.
@@ -858,7 +866,6 @@ class FAST(OffPolicyAlgorithm):
             base_action = self.augment_controller_action(base_action, is_numpy=return_numpy)
         return base_action
         
-
     def get_rewards(self, replay_data):
         """
         For clarity, should type replay_data argument: dict or ReplayBufferSamples?
@@ -867,19 +874,53 @@ class FAST(OffPolicyAlgorithm):
             # rewards = replay_data.rewards + \
             #       self.gamma * self.base_critic_value.forward_v(replay_data.next_observations).detach() - \
             #       self.base_critic_value.forward_v(replay_data.observations).detach()
-            rewards = replay_data.rewards + self.get_shaped_rewards(replay_data.observations, replay_data.next_observations)
+            rewards = replay_data.rewards + self.get_shaped_rewards(replay_data.actions, replay_data.observations)
         else:
             rewards = replay_data.rewards
         return rewards
 
-    def get_shaped_rewards(self, obs, next_obs):
-        # TODO: get_rewards function should directly call this function
-        obs_delta = th.linalg.norm(next_obs - obs, dim=1, keepdim=True)
-        obs_delta = th.clamp(obs_delta, max=0.05)
-        return obs_delta
+    def get_shaped_rewards(self, action, obs):
+        assert self.control_obs, "get_shaped_rewards currently only supports control_obs=True."
+        bs = action.shape[0]
+
+        action_gains = action.reshape(bs, self.diffusion_act_chunk, -1)[..., :2]  # Assuming first two dims are gains.
+        current_gains = obs[..., -2:]  # Assuming last two dims of obs are current gains.
+        
+
+        gain_smoothness_penalty = th.cat([
+            current_gains.unsqueeze(1) - 2 * action_gains[:, [0], :] + action_gains[:, [1], :], # inter-chunk penalty
+            action_gains[:, 0:-2, :] - 2 * action_gains[:, 1:-1, :] + action_gains[:, 2:, :], # intra-chunk penalty
+        ], dim=1)
+        gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean(dim=(1, 2), keepdim=False)
+        shaped_reward = (1.0 - th.tanh(gain_smoothness_penalty)) * 1.0
+        # gain_smoothness_penalty = current_gains - 2 * action_gains[:, 0, :] + action_gains[:, 1, :]
+
+
+        # gain_smoothness_penalty = action_gains[:, 0:-2, :] - 2 * action_gains[:, 1:-1, :] + action_gains[:, 2:, :]
+        # gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean(dim=(1, 2), keepdim=False)
+        # shaped_reward = (1.0 - th.tanh(gain_smoothness_penalty)) * 1.0
+        return shaped_reward
+        # # TODO: get_rewards function should directly call this function
+        # obs_delta = th.linalg.norm(next_obs - obs, dim=1, keepdim=True)
+        # obs_delta = th.clamp(obs_delta, max=0.05)
+        # return obs_delta
         # return self.gamma * self.base_critic_value.forward_v(next_obs).detach() - \
         #         self.base_critic_value.forward_v(obs).detach()
     
+    def smooth_gain_loss(self, actions, observations, smooth_gain_lambda):
+        assert self.control_obs, "smooth_gain_loss currently only supports control_obs=True."
+        bs = actions.shape[0]
+
+        action_gains = actions.reshape(bs, self.diffusion_act_chunk, -1)[..., :2]  # Assuming first two dims are gains.
+        current_gains = observations[..., -2:]  # Assuming last two dims of obs are current gains.
+
+        gain_smoothness_penalty = th.cat([
+            current_gains.unsqueeze(1) - 2 * action_gains[:, [0], :] + action_gains[:, [1], :], # inter-chunk penalty
+            action_gains[:, 0:-2, :] - 2 * action_gains[:, 1:-1, :] + action_gains[:, 2:, :], # intra-chunk penalty
+        ], dim=1)
+        gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean() * smooth_gain_lambda
+        return gain_smoothness_penalty
+
     def augment_controller_action(self, action, is_numpy: bool = True):
         """
         Helper function to augment action with impedance parameters based on controller config. This does nothing if 
