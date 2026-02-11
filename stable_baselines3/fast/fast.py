@@ -181,6 +181,41 @@ class FAST(OffPolicyAlgorithm):
         self.base_gamma = base_gamma
         self.base_kwargs = base_kwargs
 
+        # TODO: Handling jumpstart/jumpstart2 logic; a bit hacky right now, eventually need to clean up.
+        # If curriculum, need to keep track of current model performance.
+        # NOTE: this needs to be done in init and not setup model to properly load saved curriculum info.
+        if "jumpstart" in self.cfg.policy:
+            self.jumpstart = self.cfg.policy.jumpstart
+        else:
+            self.jumpstart = False
+
+        if "jumpstart2" in self.cfg.policy:
+            self.jumpstart2 = self.cfg.policy.jumpstart2
+            self.jumpstart_n = self.cfg.policy.jumpstart_n
+            self.jumpstart_beta = self.cfg.policy.jumpstart_beta
+            self.jumpstart_ma = self.cfg.policy.jumpstart_ma
+            self.jumpstart_stage = 1
+            self.jumpstart_performance_buffer = []
+        else:
+            self.jumpstart2 = None
+            self.jumpstart_n = 10
+            self.jumpstart_beta = 0.05
+            self.jumpstart_ma = 3
+            self.jumpstart_stage = 1
+            self.jumpstart_performance_buffer = []
+
+        # If jumpstart2 is specified, turn off jumpstart.
+        if self.jumpstart2 is not None:
+            self.jumpstart = False
+        
+        if self.jumpstart or self.jumpstart2 == "curriculum":
+            # Load base policy stats.
+            base_stats = np.loadtxt(self.cfg.base_stats_path, dtype=float)
+            self.base_avg_horizon = base_stats[0]
+            self.base_avg_success_rate = base_stats[1]
+        else:
+            self.base_avg_horizon = None
+            self.base_avg_success_rate = None
 
         if _init_setup_model:
             self._setup_model()
@@ -694,7 +729,28 @@ class FAST(OffPolicyAlgorithm):
         # residual_mag = min(
         #     (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
         # )
-        residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
+
+        # TODO: HANDLE JUMP-START RL HERE, BUT NEED ACCESS TO ENV STEP COUNT
+        # TODO: check if env is subproc env
+        # if self.cfg.policy.jumpstart:
+        if self.jumpstart:
+            env_step_count = np.array(self.env.env_method("get_step_count"))
+            horizon_threshold = 1.0 - min(self.num_timesteps / self.residual_mag_schedule, 1.0)
+            horizon_threshold = horizon_threshold * self.base_avg_horizon * self.cfg.act_steps
+            use_base = env_step_count < horizon_threshold
+            # TODO: for now, automatically use full residual mag for jsrl
+            residual_mag = 1.0
+        elif self.jumpstart2 == "random":
+            # TODO: might have to do this on the env side
+            raise NotImplementedError("Random jumpstart2 not implemented yet.")
+        elif self.jumpstart2 == "curriculum":
+            env_step_count = np.array(self.env.env_method("get_step_count"))
+            horizon_threshold = (1.0 - (self.jumpstart_stage) / self.jumpstart_n) * self.base_avg_horizon * self.cfg.act_steps
+            use_base = env_step_count < horizon_threshold
+            residual_mag = 1.0 
+        else:
+            residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
+
         action_dict = self.get_combined_action(
             observation=self._last_obs,
             deterministic=False,
@@ -702,6 +758,18 @@ class FAST(OffPolicyAlgorithm):
             residual_mag=residual_mag,
         )
         final_action = action_dict['final_action']
+
+        # Checking jump-start logic.
+        # if self.cfg.policy.jumpstart:
+        if self.jumpstart:
+            base_action = action_dict['base_action']
+            final_action = np.where(use_base[:, None], base_action, final_action)
+        if self.jumpstart2 == "random":
+            raise NotImplementedError("Random jumpstart2 not implemented yet.")
+        elif self.jumpstart2 == "curriculum":
+            base_action = action_dict['base_action']
+            final_action = np.where(use_base[:, None], base_action, final_action)
+        
         buffer_action = final_action # Buffer action is the final combined action.
         return final_action, buffer_action
         

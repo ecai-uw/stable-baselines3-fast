@@ -406,12 +406,18 @@ class ResidualSACPolicy(SACPolicy):
         # Scaling/clamping gains and residuals separately.
         residual_bounds = residual_mag_scale * self.residual_mag
         gains_bounds = residual_mag_scale * self.gains_mag
+
+        # TODO: INSTEAD OF CLAMPING RESIDUALS, SCALE THEM INSTEAD.
         if use_numpy:
-            scaled_action[..., :2] = np.clip(scaled_action[..., :2], -gains_bounds, gains_bounds)
-            scaled_action[..., 2:] = np.clip(scaled_action[..., 2:], -residual_bounds, residual_bounds)
+            # scaled_action[..., :2] = np.clip(scaled_action[..., :2], -gains_bounds, gains_bounds)
+            # scaled_action[..., 2:] = np.clip(scaled_action[..., 2:], -residual_bounds, residual_bounds)
+            scaled_action[..., :2] *= gains_bounds
+            scaled_action[..., 2:] *= residual_bounds
         else:
-            action_gains_clamped = th.clamp(scaled_action[..., :2], -gains_bounds, gains_bounds)
-            action_residual_clamped = th.clamp(scaled_action[..., 2:], -residual_bounds, residual_bounds)
+            # action_gains_clamped = th.clamp(scaled_action[..., :2], -gains_bounds, gains_bounds)
+            # action_residual_clamped = th.clamp(scaled_action[..., 2:], -residual_bounds, residual_bounds)
+            action_gains_clamped = scaled_action[..., :2] * gains_bounds
+            action_residual_clamped = scaled_action[..., 2:] * residual_bounds
             scaled_action = th.cat([action_gains_clamped, action_residual_clamped], dim=-1)
 
         # Re-shape actions back.
