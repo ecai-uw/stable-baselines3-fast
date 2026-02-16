@@ -209,13 +209,11 @@ class FAST(OffPolicyAlgorithm):
             self.jumpstart_n = self.cfg.policy.jumpstart_n
             self.jumpstart_beta = self.cfg.policy.jumpstart_beta
             self.jumpstart_ma = self.cfg.policy.jumpstart_ma
-            self.jumpstart_stage = 1
         else:
             self.jumpstart = None
             self.jumpstart_n = 10
             self.jumpstart_beta = 0.05
             self.jumpstart_ma = 3
-            self.jumpstart_stage = 1
         
         if self.jumpstart == "curriculum":
             # Load base policy stats.
