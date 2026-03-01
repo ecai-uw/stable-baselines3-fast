@@ -446,6 +446,7 @@ class OffPolicyAlgorithm(BaseAlgorithm):
         reward: np.ndarray,
         dones: np.ndarray,
         infos: list[dict[str, Any]],
+        mask: Optional[np.ndarray] = None,
     ) -> None:
         """
         Store transition in the replay buffer.
@@ -488,15 +489,26 @@ class OffPolicyAlgorithm(BaseAlgorithm):
                     # VecNormalize normalizes the terminal observation
                     if self._vec_normalize_env is not None:
                         next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])  # type: ignore[assignment]
-
-        replay_buffer.add(
-            self._last_original_obs,  # type: ignore[arg-type]
-            next_obs,  # type: ignore[arg-type]
-            buffer_action,
-            reward_,
-            dones,
-            infos,
-        )
+        
+        if mask is not None:
+            replay_buffer.add(
+                self._last_original_obs,
+                next_obs,
+                buffer_action,
+                reward_,
+                dones,
+                infos,
+                mask=mask, # Also pass mask, if supported.
+            )
+        else:
+            replay_buffer.add(
+                self._last_original_obs,  # type: ignore[arg-type]
+                next_obs,  # type: ignore[arg-type]
+                buffer_action,
+                reward_,
+                dones,
+                infos,
+            )
 
         self._last_obs = new_obs
         # Save the unnormalized observation

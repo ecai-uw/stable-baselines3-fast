@@ -1,4 +1,5 @@
-from typing import Any, ClassVar, Optional, TypeVar, Union
+import os
+from typing import Any, ClassVar, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import torch as th
@@ -6,17 +7,20 @@ from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import ReplayBuffer
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from stable_baselines3.common.utils import get_parameters_by_name, polyak_update, should_collect_more_steps
 from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
 from stable_baselines3.fast.policies import BaseCriticValue, ResidualSACPolicy
 
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, RolloutReturn, Schedule, TrainFreq, TrainFrequencyUnit
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
+
+from stable_baselines3.fast.buffers import FastBuffer
 
 from tqdm import tqdm
 from functools import partial
@@ -108,7 +112,7 @@ class FAST(OffPolicyAlgorithm):
 		train_freq: Union[int, tuple[int, str]] = 1,
 		gradient_steps: int = 1,
 		action_noise: Optional[ActionNoise] = None,
-		replay_buffer_class: Optional[type[ReplayBuffer]] = None,
+		replay_buffer_class: Optional[type[ReplayBuffer]] = FastBuffer,
 		replay_buffer_kwargs: Optional[dict[str, Any]] = None,
 		optimize_memory_usage: bool = False,
 		ent_coef: Union[str, float] = "auto",
@@ -215,9 +219,18 @@ class FAST(OffPolicyAlgorithm):
             self.jumpstart_beta = 0.05
             self.jumpstart_ma = 3
         
+        if "jumpstart_buffer" in self.cfg.policy:
+            self.jumpstart_buffer = self.cfg.policy.jumpstart_buffer
+        else:
+            self.jumpstart_buffer = True
+        
         if self.jumpstart == "curriculum":
+            base_stats_path = self.cfg.base_stats_path
+            if "simple_reset" in self.cfg.env and self.cfg.env.simple_reset:
+                base, ext = os.path.splitext(base_stats_path)
+                base_stats_path = base + "_simple_reset" + ext
             # Load base policy stats.
-            base_stats = np.loadtxt(self.cfg.base_stats_path, dtype=float)
+            base_stats = np.loadtxt(base_stats_path, dtype=float)
             self.base_avg_horizon = base_stats[0]
             self.base_avg_success_rate = base_stats[1]
         else:
@@ -732,6 +745,7 @@ class FAST(OffPolicyAlgorithm):
             # TODO: for now, automatically use full residual mag for jsrl
             residual_mag = 1.0 
         else:
+            use_base = np.zeros(n_envs, dtype=bool)
             residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
 
         action_dict = self.get_combined_action(
@@ -750,7 +764,7 @@ class FAST(OffPolicyAlgorithm):
             final_action = np.where(use_base[:, None], base_action, final_action)
         
         buffer_action = final_action # Buffer action is the final combined action.
-        return final_action, buffer_action
+        return final_action, buffer_action, use_base
         
     def predict_diffused(
         self,
@@ -790,7 +804,7 @@ class FAST(OffPolicyAlgorithm):
             random_action_dict={},
             residual_mag=residual_mag,
         )
-        return action_dict['final_action'], action_dict.get('predict_second_return', None)
+        return action_dict['final_action'], action_dict.get('scaled_action', None)
 
     def get_combined_log_prob(
         self,
@@ -1006,3 +1020,87 @@ class FAST(OffPolicyAlgorithm):
             action = action.reshape(n_actions, self.diffusion_act_chunk * (self.diffusion_act_dim + 1))
 
         return action
+
+    def collect_rollouts(
+            self,
+            env: VecEnv,
+            callback: BaseCallback,
+            train_freq: Union[int, Tuple[int, str]],
+            replay_buffer: ReplayBuffer,
+            action_noise: Optional[ActionNoise] = None,
+            learning_starts: int = 0,
+            log_interval: int = 4,
+    ):
+        """
+        Overwriting collect_rollouts to handle jumpstart-specific logic.
+        """
+        # Switch to eval mode (this affects batch norm / dropout)
+        self.policy.set_training_mode(False)
+
+        num_collected_steps, num_collected_episodes = 0, 0
+
+        assert isinstance(env, VecEnv), "You must pass a VecEnv"
+        assert train_freq.frequency > 0, "Should at least collect one step or episode."
+
+        if env.num_envs > 1:
+            assert train_freq.unit == TrainFrequencyUnit.STEP, "You must use only one env when doing episodic training."
+
+        if self.use_sde:
+            self.actor.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+        continue_training = True
+        while should_collect_more_steps(train_freq, num_collected_steps, num_collected_episodes):
+            if self.use_sde and self.sde_sample_freq > 0 and num_collected_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                self.actor.reset_noise(env.num_envs)
+
+            # Select action randomly or according to policy
+            actions, buffer_actions, use_base = self._sample_action(learning_starts, action_noise, env.num_envs)
+            # If jumpstart_buffer is True, don't mask rollout transitions.
+            buffer_mask = ~use_base if not self.jumpstart_buffer else None
+            
+            # Rescale and perform action
+            new_obs, rewards, dones, infos = env.step(actions)
+
+            self.num_timesteps += env.num_envs
+            num_collected_steps += 1
+
+            # Give access to local variables
+            callback.update_locals(locals())
+            # Only stop training if return value is False, not when it is None.
+            if not callback.on_step():
+                return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training=False)
+
+            # Retrieve reward and episode length if using Monitor wrapper
+            self._update_info_buffer(infos, dones)
+
+            # Store data in replay buffer (normalized action and unnormalized observation)
+            # TODO: only do this if we are in learning stage
+            self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos, mask=buffer_mask)  # type: ignore[arg-type]
+
+            self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
+
+            # For DQN, check if the target network should be updated
+            # and update the exploration schedule
+            # For SAC/TD3, the update is dones as the same time as the gradient update
+            # see https://github.com/hill-a/stable-baselines/issues/900
+            self._on_step()
+
+            for idx, done in enumerate(dones):
+                if done:
+                    # Update stats
+                    num_collected_episodes += 1
+                    self._episode_num += 1
+
+                    if action_noise is not None:
+                        kwargs = dict(indices=[idx]) if env.num_envs > 1 else {}
+                        action_noise.reset(**kwargs)
+
+                    # Log training infos
+                    if log_interval is not None and self._episode_num % log_interval == 0:
+                        self.dump_logs()
+        callback.on_rollout_end()
+
+        return RolloutReturn(num_collected_steps * env.num_envs, num_collected_episodes, continue_training)
+
