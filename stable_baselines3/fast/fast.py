@@ -13,6 +13,7 @@ from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import get_parameters_by_name, polyak_update, should_collect_more_steps
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, CombinedExtractor, FlattenExtractor, NatureCNN
 from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
 from stable_baselines3.fast.policies import BaseCriticValue, ResidualSACPolicy
 
@@ -20,7 +21,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Rollout
 from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
-from stable_baselines3.fast.buffers import FastBuffer
+from stable_baselines3.fast.buffers import FastBuffer, DictFastBuffer
 
 from tqdm import tqdm
 from functools import partial
@@ -95,8 +96,8 @@ class FAST(OffPolicyAlgorithm):
     actor: Actor
     critic: ContinuousCritic
     critic_target: ContinuousCritic
-    critic_base: ContinuousCritic
-    base_critic_value: BaseCriticValue
+    # critic_base: ContinuousCritic
+    # base_critic_value: BaseCriticValue
 
     def __init__(
 		self,
@@ -112,7 +113,7 @@ class FAST(OffPolicyAlgorithm):
 		train_freq: Union[int, tuple[int, str]] = 1,
 		gradient_steps: int = 1,
 		action_noise: Optional[ActionNoise] = None,
-		replay_buffer_class: Optional[type[ReplayBuffer]] = FastBuffer,
+		replay_buffer_class: Optional[type[ReplayBuffer]] = None,
 		replay_buffer_kwargs: Optional[dict[str, Any]] = None,
 		optimize_memory_usage: bool = False,
 		ent_coef: Union[str, float] = "auto",
@@ -192,6 +193,12 @@ class FAST(OffPolicyAlgorithm):
             self._setup_model()
         
     def _setup_model(self) -> None:
+        # Setting replay buffer class.
+        if self.cfg.env.use_image_obs:
+            self.replay_buffer_class = DictFastBuffer
+        else:
+            self.replay_buffer_class = FastBuffer
+
         # Extracting base policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
@@ -249,9 +256,14 @@ class FAST(OffPolicyAlgorithm):
         assert self.base_gamma >= self.gamma, "base (slow) gamma should be larger than or equal to gamma"
 
         # Updating Policy and Actor clases.
+        if self.cfg.env.use_image_obs:
+            features_extractor_class = CombinedExtractor
+        else:
+            features_extractor_class = FlattenExtractor
         if self.policy_action_condition:
             self.policy_class = partial(
                 ResidualSACPolicy, 
+                features_extractor_class=features_extractor_class,
                 policy_type=self.policy_type,
                 impedance_mode=self.policy_impedance_mode,
                 gains_only=self.policy_gains_only,
@@ -261,21 +273,21 @@ class FAST(OffPolicyAlgorithm):
                 diffusion_act_dim=self.diffusion_act_dim,
             )
 
-        # Processing observation meta.
-        if self.drop_velocity:
-            self.non_vel_indices = []
-            total_obs_size = 0
-            for key, size in self.observation_meta.items():
-                if 'qpos' not in key:
-                    self.non_vel_indices.extend(list(range(total_obs_size, total_obs_size + size)))
-                total_obs_size += size
-            if len(self.non_vel_indices) == 0:
-                raise ValueError("All observation indices are velocity indices.")
-            if len(self.non_vel_indices) == total_obs_size:
-                raise ValueError("drop_velocity is set but no velocity indices found; check observation_meta settings.")
-        else:
-            self.non_vel_indices = None
-            
+        # # Processing observation meta.
+        # if self.drop_velocity:
+        #     self.non_vel_indices = []
+        #     total_obs_size = 0
+        #     for key, size in self.observation_meta.items():
+        #         if 'qpos' not in key:
+        #             self.non_vel_indices.extend(list(range(total_obs_size, total_obs_size + size)))
+        #         total_obs_size += size
+        #     if len(self.non_vel_indices) == 0:
+        #         raise ValueError("All observation indices are velocity indices.")
+        #     if len(self.non_vel_indices) == total_obs_size:
+        #         raise ValueError("drop_velocity is set but no velocity indices found; check observation_meta settings.")
+        # else:
+        #     self.non_vel_indices = None
+        
         super()._setup_model()
         self._create_aliases()
         # Running mean and running var
@@ -316,28 +328,28 @@ class FAST(OffPolicyAlgorithm):
         if self.policy_type not in ["residual", "residual_scale", "residual_force", "residual_scale2", "residual_force2"]:
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
-        # Creating new base policy to get base critic.
-        # TODO: In the long term, this logic is probably cleaner if it just overwrites the _setup_model of OffPolicyAlgorithm
-        if self.drop_velocity:
-            if not isinstance(self.observation_space, spaces.Box):
-                raise ValueError("drop_velocity is currently only supported for Box observation spaces.")
-            base_observation_space = spaces.Box(
-                low=self.observation_space.low[self.non_vel_indices],
-                high=self.observation_space.high[self.non_vel_indices],
-                dtype=self.observation_space.dtype,
-            )
-        else:
-            base_observation_space = self.observation_space
+        # # Creating new base policy to get base critic.
+        # # TODO: In the long term, this logic is probably cleaner if it just overwrites the _setup_model of OffPolicyAlgorithm
+        # if self.drop_velocity:
+        #     if not isinstance(self.observation_space, spaces.Box):
+        #         raise ValueError("drop_velocity is currently only supported for Box observation spaces.")
+        #     base_observation_space = spaces.Box(
+        #         low=self.observation_space.low[self.non_vel_indices],
+        #         high=self.observation_space.high[self.non_vel_indices],
+        #         dtype=self.observation_space.dtype,
+        #     )
+        # else:
+        #     base_observation_space = self.observation_space
 
-        # Creating base critic and base value net.
-        self.base_kwargs.update({
-            "observation_space": base_observation_space,
-            "action_space": self.action_space,
-            "lr_schedule": self.lr_schedule,
-            "features_extractor_class": self.policy.features_extractor_class,
-            "non_vel_indices": self.non_vel_indices,
-        })
-        self.base_critic_value = BaseCriticValue(**self.base_kwargs).to(self.device)
+        # # Creating base critic and base value net.
+        # self.base_kwargs.update({
+        #     "observation_space": base_observation_space,
+        #     "action_space": self.action_space,
+        #     "lr_schedule": self.lr_schedule,
+        #     "features_extractor_class": self.policy.features_extractor_class,
+        #     "non_vel_indices": self.non_vel_indices,
+        # })
+        # self.base_critic_value = BaseCriticValue(**self.base_kwargs).to(self.device)
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor # fast policy 
@@ -681,7 +693,8 @@ class FAST(OffPolicyAlgorithm):
         )
     
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy", "base_critic_value"]  # noqa: RUF005
+        # return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy", "base_critic_value"]  # noqa: RUF005
+        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy"]
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         # Standard SAC save parameters.
@@ -692,12 +705,12 @@ class FAST(OffPolicyAlgorithm):
         else:
             saved_pytorch_variables = ["ent_coef_tensor"]
 
-        # FAST specific save parameters.
-        state_dicts.extend(["base_critic_value"])
-        state_dicts.extend([
-            "base_critic_value.critic.optimizer",
-            "base_critic_value.value_net.optimizer",
-        ])
+        # # FAST specific save parameters.
+        # state_dicts.extend(["base_critic_value"])
+        # state_dicts.extend([
+        #     "base_critic_value.critic.optimizer",
+        #     "base_critic_value.value_net.optimizer",
+        # ])
         return state_dicts, saved_pytorch_variables
     
     def _sample_action(
@@ -787,7 +800,6 @@ class FAST(OffPolicyAlgorithm):
         :return: the model's action and the next hidden state
             (used in recurrent policies)
         """
-
         if self.jumpstart == "curriculum":
             # TODO: for now, automatically use full residual mag for jsrl
             residual_mag = 1.0
@@ -908,20 +920,32 @@ class FAST(OffPolicyAlgorithm):
     
     def sample_base_policy(
         self, 
-        observation: Union[np.ndarray, th.Tensor], 
+        observation: Union[np.ndarray, th.Tensor, dict[str, Union[np.ndarray, th.Tensor]]], 
         return_numpy: bool,
     ) -> Union[np.ndarray, th.Tensor]:
         """
         Helper function to sample action from base diffusion policy only.
-        """
-        # Remove controller params from environment observation for diffusion policy, if necessary.
-        base_observation = observation[..., :-2] if self.control_obs else observation
-        noise = th.randn((base_observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-        if isinstance(base_observation, np.ndarray):
-            base_observation_tensor = th.as_tensor(base_observation, device=self.device, dtype=th.float32)
+        """        
+        if isinstance(observation, dict):
+            # Remove controller params from environment observation for diffusion policy, if necessary.
+            base_observation_state = observation["state"][..., :-2] if self.control_obs else observation["state"]
+            base_observation_rgb = observation["rgb"]
+            if isinstance(base_observation_state, np.ndarray):
+                base_observation_state = th.as_tensor(base_observation_state, device=self.device, dtype=th.float32)
+            if isinstance(base_observation_rgb, np.ndarray):
+                base_observation_rgb = th.as_tensor(base_observation_rgb, device=self.device, dtype=th.float32)
+            base_observation = {
+                "state": base_observation_state.unsqueeze(1),  # Adding dummy time dimension for diffusion policy.
+                "rgb": base_observation_rgb.unsqueeze(1), # Adding dummy time dimension for diffusion policy.
+            }
         else:
-            base_observation_tensor = base_observation
-        base_action = self.diffusion_policy(base_observation_tensor, noise, return_numpy=return_numpy)
+            # Remove controller params from environment observation for diffusion policy, if necessary.
+            base_observation = observation[..., :-2] if self.control_obs else observation
+            # noise = th.randn((base_observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
+            if isinstance(base_observation, np.ndarray):
+                base_observation = th.as_tensor(base_observation, device=self.device, dtype=th.float32)
+        
+        base_action = self.diffusion_policy(base_observation, return_numpy=return_numpy)
         base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
         # Depending on impedance mode, augmenting base action based on controller config.
         if self.policy_impedance_mode != "fixed":
@@ -962,12 +986,6 @@ class FAST(OffPolicyAlgorithm):
         # gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean(dim=(1, 2), keepdim=False)
         # shaped_reward = (1.0 - th.tanh(gain_smoothness_penalty)) * 1.0
         return shaped_reward
-        # # TODO: get_rewards function should directly call this function
-        # obs_delta = th.linalg.norm(next_obs - obs, dim=1, keepdim=True)
-        # obs_delta = th.clamp(obs_delta, max=0.05)
-        # return obs_delta
-        # return self.gamma * self.base_critic_value.forward_v(next_obs).detach() - \
-        #         self.base_critic_value.forward_v(obs).detach()
     
     def smooth_gain_loss(self, actions, observations, smooth_gain_lambda):
         assert self.control_obs, "smooth_gain_loss currently only supports control_obs=True."

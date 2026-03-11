@@ -195,7 +195,6 @@ class ReplayBuffer(BaseBuffer):
     observations: np.ndarray
     next_observations: np.ndarray
     actions: np.ndarray
-    noise_actions: np.ndarray
     rewards: np.ndarray
     dones: np.ndarray
     timeouts: np.ndarray
@@ -238,10 +237,6 @@ class ReplayBuffer(BaseBuffer):
         self.actions = np.zeros(
             (self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype)
         )
-        self.noise_actions = np.zeros(
-            (self.buffer_size, self.n_envs, self.action_dim), dtype=self._maybe_cast_dtype(action_space.dtype)
-        )
-        self.use_noise_actions = False
 
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
@@ -275,7 +270,6 @@ class ReplayBuffer(BaseBuffer):
         reward: np.ndarray,
         done: np.ndarray,
         infos: list[dict[str, Any]],
-        noise_action: Optional[np.ndarray] = None,
     ) -> None:
         # Reshape needed when using multiple envs with discrete observations
         # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
@@ -295,9 +289,6 @@ class ReplayBuffer(BaseBuffer):
             self.next_observations[self.pos] = np.array(next_obs)
 
         self.actions[self.pos] = np.array(action)
-        if noise_action is not None:
-            self.use_noise_actions = True
-            self.noise_actions[self.pos] = np.array(noise_action)
         self.rewards[self.pos] = np.array(reward)
         self.dones[self.pos] = np.array(done)
 
@@ -340,27 +331,15 @@ class ReplayBuffer(BaseBuffer):
         else:
             next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
 
-        if self.use_noise_actions:
-            data = (
-                self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
-                self.actions[batch_inds, env_indices, :],
-                next_obs,
-                # Only use dones that are not due to timeouts
-                # deactivated by default (timeouts is initialized as an array of False)
-                (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-                self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
-                self.noise_actions[batch_inds, env_indices, :],
-            )
-        else:
-            data = (
-                self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
-                self.actions[batch_inds, env_indices, :],
-                next_obs,
-                # Only use dones that are not due to timeouts
-                # deactivated by default (timeouts is initialized as an array of False)
-                (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-                self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
-            )
+        data = (
+            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
+            self.actions[batch_inds, env_indices, :],
+            next_obs,
+            # Only use dones that are not due to timeouts
+            # deactivated by default (timeouts is initialized as an array of False)
+            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
+            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+        )
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
     @staticmethod
