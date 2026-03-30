@@ -35,7 +35,6 @@ class FAST(OffPolicyAlgorithm):
 
     :param policy: The policy model to use (MlpPolicy, CnnPolicy, ...)
     :param env: The environment to learn from (if registered in Gym, can be str)
-    :param base_kwargs: Arguments for the base (slow) critic.
 	:param learning_rate: learning rate for adam optimizer,
 		the same learning rate will be used for all networks (Q-Values, Actor and Value function)
 		it can be a function of the current progress remaining (from 1 to 0)
@@ -83,9 +82,6 @@ class FAST(OffPolicyAlgorithm):
 	:param diffusion_policy: The diffusion policy to use for action generation
 	:param diffusion_act_dim: The action dimension for the diffusion policy (tuple of (action chunk length, action_dim))
 	:param critic_backup_combine_type: How to combine the critics for the backup (min or mean)
-    :param base_gamma: the discount factor for the base (slow) critic
-    :param policy_action_condition: Whether to condition fast policy on base action
-    :param shape_rewards: Whether to use PBRS from base policy values.
     """
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
 		"MlpPolicy": MlpPolicy,
@@ -96,14 +92,11 @@ class FAST(OffPolicyAlgorithm):
     actor: Actor
     critic: ContinuousCritic
     critic_target: ContinuousCritic
-    # critic_base: ContinuousCritic
-    # base_critic_value: BaseCriticValue
 
     def __init__(
 		self,
 		policy: Union[str, type[SACPolicy]],
 		env: Union[GymEnv, str],
-        base_kwargs: Optional[dict[str, Any]] = None,
 		learning_rate: Union[float, Schedule] = 3e-4,
 		buffer_size: int = 1_000_000,  # 1e6
 		learning_starts: int = 100,
@@ -133,10 +126,6 @@ class FAST(OffPolicyAlgorithm):
 		diffusion_policy=None,
 		diffusion_act_dim=(1, 1),
         critic_backup_combine_type='min',
-		base_gamma: float = 0.995,
-        # base_gradient_steps: int = -1,
-        # policy_action_condition: bool = False,
-        # shape_rewards: bool = False,
         cfg: dict = {},
 	):
         super().__init__(
@@ -183,8 +172,6 @@ class FAST(OffPolicyAlgorithm):
         self.diffusion_act_chunk = diffusion_act_dim[0]
         self.diffusion_act_dim = diffusion_act_dim[1]
         self.critic_backup_combine_type = critic_backup_combine_type
-        self.base_gamma = base_gamma
-        self.base_kwargs = base_kwargs
 
         # This will only be used for jumpstart curriculum, and will be overwritten by load mdel.
         self.jumpstart_stage = 1
@@ -206,11 +193,9 @@ class FAST(OffPolicyAlgorithm):
         self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
         self.policy_action_condition = self.cfg.policy.action_condition
         self.shape_rewards = self.cfg.policy.shape_rewards
-        self.base_gradient_steps = self.cfg.policy.base_gradient_steps
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
         self.gains_mag = self.cfg.policy.gains_mag
-        self.drop_velocity = self.cfg.policy.drop_velocity
         
         # TODO: Handling jumpstart logic; a bit hacky right now, eventually need to clean up.
         # If curriculum, need to keep track of current model performance.
@@ -252,9 +237,6 @@ class FAST(OffPolicyAlgorithm):
         # Observation meta for processing observations.
         self.observation_meta = self.cfg.env.observation_meta
 
-        # Sanity checks.
-        assert self.base_gamma >= self.gamma, "base (slow) gamma should be larger than or equal to gamma"
-
         # Updating Policy and Actor clases.
         if self.cfg.env.use_image_obs:
             features_extractor_class = CombinedExtractor
@@ -272,21 +254,6 @@ class FAST(OffPolicyAlgorithm):
                 chunk_size=self.diffusion_act_chunk,
                 diffusion_act_dim=self.diffusion_act_dim,
             )
-
-        # # Processing observation meta.
-        # if self.drop_velocity:
-        #     self.non_vel_indices = []
-        #     total_obs_size = 0
-        #     for key, size in self.observation_meta.items():
-        #         if 'qpos' not in key:
-        #             self.non_vel_indices.extend(list(range(total_obs_size, total_obs_size + size)))
-        #         total_obs_size += size
-        #     if len(self.non_vel_indices) == 0:
-        #         raise ValueError("All observation indices are velocity indices.")
-        #     if len(self.non_vel_indices) == total_obs_size:
-        #         raise ValueError("drop_velocity is set but no velocity indices found; check observation_meta settings.")
-        # else:
-        #     self.non_vel_indices = None
         
         super()._setup_model()
         self._create_aliases()
@@ -324,32 +291,8 @@ class FAST(OffPolicyAlgorithm):
         
 
         # Overwrite model policy to create base-conditioned fast policy.
-        # if self.policy_type != 'residual':
         if self.policy_type not in ["residual", "residual_scale", "residual_force", "residual_scale2", "residual_force2"]:
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
-
-        # # Creating new base policy to get base critic.
-        # # TODO: In the long term, this logic is probably cleaner if it just overwrites the _setup_model of OffPolicyAlgorithm
-        # if self.drop_velocity:
-        #     if not isinstance(self.observation_space, spaces.Box):
-        #         raise ValueError("drop_velocity is currently only supported for Box observation spaces.")
-        #     base_observation_space = spaces.Box(
-        #         low=self.observation_space.low[self.non_vel_indices],
-        #         high=self.observation_space.high[self.non_vel_indices],
-        #         dtype=self.observation_space.dtype,
-        #     )
-        # else:
-        #     base_observation_space = self.observation_space
-
-        # # Creating base critic and base value net.
-        # self.base_kwargs.update({
-        #     "observation_space": base_observation_space,
-        #     "action_space": self.action_space,
-        #     "lr_schedule": self.lr_schedule,
-        #     "features_extractor_class": self.policy.features_extractor_class,
-        #     "non_vel_indices": self.non_vel_indices,
-        # })
-        # self.base_critic_value = BaseCriticValue(**self.base_kwargs).to(self.device)
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor # fast policy 
@@ -375,15 +318,6 @@ class FAST(OffPolicyAlgorithm):
             actor_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
         else:
             actor_gradient_idx = np.linspace(int(gradient_steps / self.actor_gradient_steps) - 1, gradient_steps-1, self.actor_gradient_steps, dtype=int)
-
-        # Getting update steps for base critic/value.
-        if self.base_gradient_steps < 0:
-            base_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
-        # If 0, don't update base critic/value.
-        elif self.base_gradient_steps == 0:
-            base_gradient_idx = np.array([], dtype=int)
-        else:
-            base_gradient_idx = np.linspace(int(gradient_steps / self.base_gradient_steps) - 1, gradient_steps-1, self.base_gradient_steps, dtype=int)
 
         # gradient steps should be set by utd.
         for gradient_step in range(gradient_steps):
@@ -508,17 +442,6 @@ class FAST(OffPolicyAlgorithm):
                 # Copy running stats, see GH issue #996
                 polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
-            # Update base critic/value.
-            if gradient_step in base_gradient_idx and self.shape_rewards:
-                self.train_base_value(
-                    fqe_steps=1,
-                    vd_steps=1,
-                    batch_size=batch_size,
-                    vd_samples=self.cfg.base.vd_samples,
-                    pre_train=False,
-                    replay_data=replay_data,
-                )
-
         self._n_updates += gradient_steps
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
@@ -529,150 +452,6 @@ class FAST(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
-
-    def train_base_value(
-        self, 
-        fqe_steps: int, 
-        vd_steps: int, 
-        batch_size: int = 64, 
-        vd_samples: int = 16,
-        pre_train: bool = False,
-        replay_data: Optional[Any] = None,
-    ) -> None:
-        """
-        Run Fitted Q Evaluation (FQE) to train the base (slow) critic, then distill
-        into the base value function (VD). NOTE: this function does not unscale actions, but it shouldn't 
-        matter, since we only use the distilled state value function.
-
-        :param total_steps: Total number of gradient steps to take.
-        :param batch_size: Batch size for each gradient update.
-        """
-        # Sanity check.
-        if not self.shape_rewards:
-            # TODO: this is really hacky, may need to clean up alter
-            warnings.simplefilter("always")
-            # ANSI escape codes for colors
-            RED = "\033[91m"
-            YELLOW = "\033[93m"
-            RESET = "\033[0m"
-
-            def colored_warning(message, category, filename, lineno, file=None, line=None):
-                # Customize the warning message format
-                print(f"{YELLOW}Warning: {message} ({category.__name__}) at {filename}:{lineno}{RESET}")
-
-            # Override the default showwarning
-            warnings.showwarning = colored_warning
-            warnings.warn("FAST.train_base_value() called with shape_rewards=False; learned value will not be used for reward shaping.", UserWarning)
-        
-        # Switch to train mode.
-        self.base_critic_value.critic.set_training_mode(True)
-        # Create learning rate scheduler.
-        if pre_train:
-            # If pretraining, use cosine annealing lr schedule.
-            lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.critic.optimizer, T_max=fqe_steps)
-        else:
-            # Otherwise, use constant lr.
-            lr_scheduler = th.optim.lr_scheduler.LambdaLR(self.base_critic_value.critic.optimizer, lr_lambda=lambda step: 1.0)
-
-        # Update base critic; only show progress bar if pre-training.
-        with tqdm(range(fqe_steps), disable=not pre_train) as pbar:
-            for step in pbar:
-                # If replay data is not provided (pre-training), sample from replay buffer.
-                if replay_data is None:
-                    replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
-                # observations, actions, next_observations, dones, rewards
-
-                with th.no_grad():
-                    # Sample actions from base diffusion policy.
-                    # noise = th.randn((batch_size, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-                    # actions = self.diffusion_policy(replay_data.observations, noise, return_numpy=False)
-                    # actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-
-                    # Sample next actions from base diffusion policy.
-                    # next_noise = th.randn((batch_size, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-                    # next_actions = self.diffusion_policy(replay_data.next_observations, next_noise, return_numpy=False)
-                    # next_actions = next_actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-
-                    next_actions = self.sample_base_policy(replay_data.next_observations, return_numpy=False)
-
-                    # # Augmenting base policy actions depending on impedance mode.
-                    # if self.policy_impedance_mode != "fixed":
-                    #     next_actions = self.augment_controller_action(next_actions, is_numpy=False)
-
-                    # Compute next Q values using base critic target.
-                    next_q_values = th.cat(self.base_critic_value.forward_qt(replay_data.next_observations, next_actions), dim=1)
-                    if self.critic_backup_combine_type == 'min':
-                        next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                    elif self.critic_backup_combine_type == 'mean':
-                        next_q_values = th.mean(next_q_values, dim=1, keepdim=True)
-
-                    # Compute TD target.
-                    target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.base_gamma * next_q_values
-
-                # Compute current Q values, with actions in the buffer.
-                current_q_values = self.base_critic_value.forward_q(replay_data.observations, replay_data.actions)
-
-                # Compute critic loss.
-                critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
-                pbar.set_postfix(critic_loss=critic_loss.item())
-
-                # Optimize.
-                self.base_critic_value.critic.optimizer.zero_grad()
-                critic_loss.backward()
-                self.base_critic_value.critic.optimizer.step()
-                lr_scheduler.step()
-
-                # Update target networks.
-                if step % self.target_update_interval == 0:
-                    # NOTE: this skips updating running stats, since the critic is assumed to not use batch norm
-                    polyak_update(self.base_critic_value.critic.parameters(), self.base_critic_value.critic_target.parameters(), self.tau)
-
-        self.base_critic_value.critic.set_training_mode(False)
-
-        # Now, distill base critic into base value function.
-        self.base_critic_value.value_net.set_training_mode(True)
-        # Create learning rate scheduler.
-        if pre_train:
-            value_lr_scheduler = th.optim.lr_scheduler.CosineAnnealingLR(self.base_critic_value.value_net.optimizer, T_max=vd_steps)
-        else:
-            value_lr_scheduler = th.optim.lr_scheduler.LambdaLR(self.base_critic_value.value_net.optimizer, lr_lambda=lambda step: 1.0)
-        
-        # Update base value function; only show progress bar if pre-training.
-        with tqdm(range(vd_steps), disable=not pre_train) as pbar:
-            for step in pbar:
-                # If replay data is not provided (pre-training), sample from replay buffer.
-                if replay_data is None:
-                    replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
-
-                with th.no_grad():
-                    # Sample actions from base diffusion policy.
-                    # noise = th.randn((batch_size * vd_samples, self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-                    obs = replay_data.observations.unsqueeze(1).expand(-1, vd_samples, -1).reshape(batch_size * vd_samples, -1)
-                    # actions = self.diffusion_policy(obs, noise, return_numpy=False)
-                    # actions = actions.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-                    # # Augmenting base policy actions depending on impedance mode.
-                    # if self.policy_impedance_mode != "fixed":
-                    #     actions = self.augment_controller_action(actions, is_numpy=False)
-                    actions = self.sample_base_policy(obs, return_numpy=False)
-                    
-                    # Compute Q values using base critic; average across critics and across vd_samples.
-                    mean_q_values = th.cat(self.base_critic_value.forward_q(obs, actions), dim=1).mean(dim=1, keepdim=True)
-                    mean_q_values = mean_q_values.reshape(batch_size, vd_samples).mean(dim=1, keepdim=True)
-                
-                # Compute current V values.
-                current_v_values = self.base_critic_value.forward_v(replay_data.observations)
-
-                # Compute value loss.
-                value_loss = F.mse_loss(current_v_values, mean_q_values)
-                pbar.set_postfix(value_loss=value_loss.item())
-
-                # Optimize.
-                self.base_critic_value.value_net.optimizer.zero_grad()
-                value_loss.backward()
-                self.base_critic_value.value_net.optimizer.step()
-                value_lr_scheduler.step()
-
-        self.base_critic_value.value_net.set_training_mode(False)
 
     def learn(
         self: SelfFAST,
@@ -693,8 +472,7 @@ class FAST(OffPolicyAlgorithm):
         )
     
     def _excluded_save_params(self) -> list[str]:
-        # return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy", "base_critic_value"]  # noqa: RUF005
-        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy"]
+        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy"] # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         # Standard SAC save parameters.
@@ -704,13 +482,6 @@ class FAST(OffPolicyAlgorithm):
             state_dicts.append("ent_coef_optimizer")
         else:
             saved_pytorch_variables = ["ent_coef_tensor"]
-
-        # # FAST specific save parameters.
-        # state_dicts.extend(["base_critic_value"])
-        # state_dicts.extend([
-        #     "base_critic_value.critic.optimizer",
-        #     "base_critic_value.value_net.optimizer",
-        # ])
         return state_dicts, saved_pytorch_variables
     
     def _sample_action(
@@ -741,13 +512,8 @@ class FAST(OffPolicyAlgorithm):
             random_action_dict['n_envs'] = n_envs
             if action_noise is not None:
                 random_action_dict['action_noise'] = action_noise
-        # Setting residual scale based on residual scale schedule.
-        # residual_mag = min(
-        #     (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
-        # )
 
-        # TODO: HANDLE JUMP-START RL HERE, BUT NEED ACCESS TO ENV STEP COUNT
-        # TODO: check if env is subproc env
+        # Handling jumpstart logic.
         if self.jumpstart == "random":
             # TODO: might have to do this on the env side
             raise NotImplementedError("Random jumpstart not implemented yet.")
@@ -758,6 +524,7 @@ class FAST(OffPolicyAlgorithm):
             # TODO: for now, automatically use full residual mag for jsrl
             residual_mag = 1.0 
         else:
+            # Setting residual scale based on residual scale schedule.
             use_base = np.zeros(n_envs, dtype=bool)
             residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
 
@@ -837,9 +604,6 @@ class FAST(OffPolicyAlgorithm):
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
             # Setting residual scale based on residual scale schedule.
-            # residual_mag = min(
-            #     (self.num_timesteps / self.residual_mag_schedule) * self.residual_mag, self.residual_mag
-            # )
             residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
             final_action_dict = self.policy.get_final_action(
                 scaled_action, base_action, residual_mag, use_numpy=False
