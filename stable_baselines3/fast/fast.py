@@ -235,7 +235,7 @@ class FAST(OffPolicyAlgorithm):
         assert self.policy_impedance_mode == self.controller_configs.impedance_mode, "Controller impedance mode in cfg.controller must match cfg.policy.impedance_mode"
 
         # Observation meta for processing observations.
-        self.observation_meta = self.cfg.env.observation_meta
+        self.observation_meta = self.cfg.observation_meta
 
         # Updating Policy and Actor clases.
         if self.cfg.env.use_image_obs:
