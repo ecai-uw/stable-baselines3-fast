@@ -223,7 +223,6 @@ class FAST(OffPolicyAlgorithm):
             self.base_avg_success_rate = None
 
         # Extracting controller params.
-        self.control_obs = self.cfg.env.control_obs
         self.controller_configs = self.cfg.controller
         assert self.policy_impedance_mode == self.controller_configs.impedance_mode, "Controller impedance mode in cfg.controller must match cfg.policy.impedance_mode"
 
@@ -253,9 +252,14 @@ class FAST(OffPolicyAlgorithm):
 
         # Build RL-only observation space from policy.observation_meta.
         # This is a subset of the full env obs space — actor/critic only see these keys.
+        # Under variable impedance, controller_state is auto-emitted by the env wrapper
+        # and auto-included here (symmetric with how the residual action space grows by +2).
         rl_obs_meta = self.cfg.policy.observation_meta
+        rl_low_dim = list(rl_obs_meta.low_dim_keys)
+        if self.policy_impedance_mode == "variable":
+            rl_low_dim.append("controller_state")
         rl_obs_spaces = {}
-        for key in list(rl_obs_meta.low_dim_keys) + list(rl_obs_meta.get("image_keys", [])):
+        for key in rl_low_dim + list(rl_obs_meta.get("image_keys", [])):
             rl_obs_spaces[key] = self.observation_space[key]
         self.rl_observation_space = spaces.Dict(rl_obs_spaces)
 
@@ -882,30 +886,19 @@ class FAST(OffPolicyAlgorithm):
         if self.policy_impedance_mode == "fixed":
             return action
 
-        # Action shape should be (n_envs, chunk_size * act_dim)
+        # Variable impedance: prepend damping + stiffness scalar channels (both zero in the
+        # normalized action space, so the base policy contributes neutral gains).
         n_actions = action.shape[0]
         action = action.reshape(n_actions, self.chunk_size, self.action_dim)
-        # Creating stiffness action, since it's required for both variable and variable_kp modes.
         if is_numpy:
+            damping_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
             stiffness_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
+            action = np.concatenate([damping_action, stiffness_action, action], axis=-1)
         else:
+            damping_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
             stiffness_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
-
-        # Creating damping action, if necessary.
-        if self.policy_impedance_mode == "variable":
-            if is_numpy:
-                damping_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
-                action = np.concatenate([damping_action, stiffness_action, action], axis=-1)
-            else:
-                damping_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
-                action = th.cat([damping_action, stiffness_action, action], dim=-1)
-            action = action.reshape(n_actions, self.chunk_size * (self.action_dim + 2))
-        elif self.policy_impedance_mode == "variable_kp":
-            if is_numpy:
-                action = np.concatenate([stiffness_action, action], axis=-1)
-            else:
-                action = th.cat([stiffness_action, action], dim=-1)
-            action = action.reshape(n_actions, self.chunk_size * (self.action_dim + 1))
+            action = th.cat([damping_action, stiffness_action, action], dim=-1)
+        action = action.reshape(n_actions, self.chunk_size * (self.action_dim + 2))
 
         return action
 
