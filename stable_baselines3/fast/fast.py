@@ -714,6 +714,12 @@ class FAST(OffPolicyAlgorithm):
         # Depending on impedance mode, augmenting base action based on controller config.
         if self.policy_impedance_mode != "fixed":
             base_action = self.augment_controller_action(base_action, is_numpy=return_numpy)
+        
+        if return_numpy:
+            base_action = base_action.astype(np.float32)
+        else:
+            base_action = base_action.to(th.float32)
+
         return base_action
         
     def get_rewards(self, replay_data):
