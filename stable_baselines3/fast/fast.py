@@ -80,7 +80,6 @@ class FAST(OffPolicyAlgorithm):
         :param _init_setup_model: Whether or not to build the network at the creation of the instance
 	:param actor_gradient_steps: Number of gradient steps to take on actor per training update
 	:param diffusion_policy: The diffusion policy to use for action generation
-	:param diffusion_act_dim: The action dimension for the diffusion policy (tuple of (action chunk length, action_dim))
 	:param critic_backup_combine_type: How to combine the critics for the backup (min or mean)
     """
     policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
@@ -124,7 +123,6 @@ class FAST(OffPolicyAlgorithm):
 		_init_setup_model: bool = True,
 		actor_gradient_steps: int = -1,
 		diffusion_policy=None,
-		diffusion_act_dim=(1, 1),
         critic_backup_combine_type='min',
         cfg: dict = {},
 	):
@@ -169,8 +167,8 @@ class FAST(OffPolicyAlgorithm):
         self.cfg = cfg
 
         self.diffusion_policy = diffusion_policy
-        self.diffusion_act_chunk = diffusion_act_dim[0]
-        self.diffusion_act_dim = diffusion_act_dim[1]
+        self.chunk_size = cfg.base_policy.chunk_size
+        self.action_dim = cfg.base_policy.action_dim
         self.critic_backup_combine_type = critic_backup_combine_type
 
         # This will only be used for jumpstart curriculum, and will be overwritten by load mdel.
@@ -180,18 +178,12 @@ class FAST(OffPolicyAlgorithm):
             self._setup_model()
         
     def _setup_model(self) -> None:
-        # Setting replay buffer class.
-        if self.cfg.env.use_image_obs:
-            self.replay_buffer_class = DictFastBuffer
-        else:
-            self.replay_buffer_class = FastBuffer
-
         # Extracting base policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
         self.policy_gains_only = self.cfg.policy.gains_only
         self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
-        self.policy_action_condition = self.cfg.policy.action_condition
+        # self.policy_action_condition = self.cfg.policy.action_condition
         self.shape_rewards = self.cfg.policy.shape_rewards
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
@@ -235,27 +227,63 @@ class FAST(OffPolicyAlgorithm):
         assert self.policy_impedance_mode == self.controller_configs.impedance_mode, "Controller impedance mode in cfg.controller must match cfg.policy.impedance_mode"
 
         # Observation meta for processing observations.
-        self.observation_meta = self.cfg.observation_meta
+        # self.observation_meta = self.cfg.observation_meta
 
-        # Updating Policy and Actor clases.
+        # Inline super()._setup_model() so buffer and policy get different obs spaces.
+        # Buffer stores the full env obs (all keys incl. base policy's images).
+        # Policy (actor/critic) only sees the RL subset.
+        self._setup_lr_schedule()
+        self.set_random_seed(self.seed)
+
+        # Setting replay buffer class.
         if self.cfg.env.use_image_obs:
-            features_extractor_class = CombinedExtractor
+            self.replay_buffer_class = DictFastBuffer
+        else:
+            self.replay_buffer_class = FastBuffer
+
+        self.replay_buffer = self.replay_buffer_class(
+            self.buffer_size,
+            self.observation_space,
+            self.action_space,
+            device=self.device,
+            n_envs=self.n_envs,
+            optimize_memory_usage=self.optimize_memory_usage,
+        )
+
+        # Build RL-only observation space from policy.observation_meta.
+        # This is a subset of the full env obs space — actor/critic only see these keys.
+        rl_obs_meta = self.cfg.policy.observation_meta
+        rl_obs_spaces = {}
+        for key in list(rl_obs_meta.low_dim_keys) + list(rl_obs_meta.get("image_keys", [])):
+            rl_obs_spaces[key] = self.observation_space[key]
+        self.rl_observation_space = spaces.Dict(rl_obs_spaces)
+
+        if len(rl_obs_spaces) > 1 or any(len(s.shape) > 1 for s in rl_obs_spaces.values()):
+            features_extractor_class = partial(CombinedExtractor, normalized_image=True)
         else:
             features_extractor_class = FlattenExtractor
-        if self.policy_action_condition:
-            self.policy_class = partial(
-                ResidualSACPolicy, 
-                features_extractor_class=features_extractor_class,
-                policy_type=self.policy_type,
-                impedance_mode=self.policy_impedance_mode,
-                gains_only=self.policy_gains_only,
-                residual_mag=self.residual_mag,
-                gains_mag=self.gains_mag,
-                chunk_size=self.diffusion_act_chunk,
-                diffusion_act_dim=self.diffusion_act_dim,
-            )
+        # if self.policy_action_condition:
+        # TODO: clean this up
+        self.policy_class = partial(
+            ResidualSACPolicy,
+            features_extractor_class=features_extractor_class,
+            policy_type=self.policy_type,
+            impedance_mode=self.policy_impedance_mode,
+            gains_only=self.policy_gains_only,
+            residual_mag=self.residual_mag,
+            gains_mag=self.gains_mag,
+            chunk_size=self.chunk_size,
+            diffusion_act_dim=self.action_dim,
+        )
         
-        super()._setup_model()
+        self.policy = self.policy_class(
+            self.rl_observation_space,
+            self.action_space,
+            self.lr_schedule,
+            **self.policy_kwargs,
+        )
+        self.policy = self.policy.to(self.device)
+        self._convert_train_freq()
         self._create_aliases()
         # Running mean and running var
         self.batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
@@ -295,9 +323,15 @@ class FAST(OffPolicyAlgorithm):
             raise NotImplementedError("Only 'residual' policy type is implemented for FAST.")
 
     def _create_aliases(self) -> None:
-        self.actor = self.policy.actor # fast policy 
+        self.actor = self.policy.actor # fast policy
         self.critic = self.policy.critic # fast critic
         self.critic_target = self.policy.critic_target # fast critic target, using reward shaping
+
+    def _filter_rl_obs(self, obs):
+        # Buffer stores full env obs; actor/critic only know the RL subset.
+        if isinstance(obs, dict):
+            return {k: obs[k] for k in self.rl_observation_space.spaces}
+        return obs
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
         # Switch to train mode (this affects batch norm / dropout)
@@ -362,7 +396,7 @@ class FAST(OffPolicyAlgorithm):
                 next_actions = th.tensor(self.policy.unscale_action(next_action_dict['final_action'].cpu().numpy())).to(self.device)
                 next_log_prob = next_action_dict['log_prob']
                 # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
+                next_q_values = th.cat(self.critic_target(self._filter_rl_obs(replay_data.next_observations), next_actions), dim=1)
                 next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
                 if self.critic_backup_combine_type == 'min':
                     next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
@@ -376,7 +410,7 @@ class FAST(OffPolicyAlgorithm):
             
             # Get current Q-values estimates for each critic network
 			# using action from the replay buffer
-            current_q_values = self.critic(replay_data.observations, replay_data.actions)
+            current_q_values = self.critic(self._filter_rl_obs(replay_data.observations), replay_data.actions)
 
             # compute critic loss
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
@@ -392,7 +426,7 @@ class FAST(OffPolicyAlgorithm):
                 # Compute actor loss
 				# Alternative: actor_loss = th.mean(log_prob - qf1_pi)
 				# Min over all critic networks
-                q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
+                q_values_pi = th.cat(self.critic(self._filter_rl_obs(replay_data.observations), actions_pi), dim=1)
                 if self.critic_backup_combine_type == 'min':
                     min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
                 elif self.critic_backup_combine_type == 'mean':
@@ -519,7 +553,7 @@ class FAST(OffPolicyAlgorithm):
             raise NotImplementedError("Random jumpstart not implemented yet.")
         elif self.jumpstart == "curriculum":
             env_step_count = np.array(self.env.env_method("get_step_count"))
-            horizon_threshold = (1.0 - (self.jumpstart_stage) / self.jumpstart_n) * self.base_avg_horizon * self.cfg.act_steps
+            horizon_threshold = (1.0 - (self.jumpstart_stage) / self.jumpstart_n) * self.base_avg_horizon * self.chunk_size
             use_base = env_step_count < horizon_threshold
             # TODO: for now, automatically use full residual mag for jsrl
             residual_mag = 1.0 
@@ -598,7 +632,7 @@ class FAST(OffPolicyAlgorithm):
         base_action = self.sample_base_policy(observation, return_numpy=False)
 
         # Sample action from fast policy.
-        full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
+        full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action} # if self.policy_action_condition else observation
         scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
         
         # Combine base action and fast policy action.
@@ -656,7 +690,7 @@ class FAST(OffPolicyAlgorithm):
                 scaled_action = unscaled_action
         else:
             # Use predict() otherwise; this unsquashes, so re-scale if needed.
-            full_obs = {"obs": observation, "base_action": base_action} if self.policy_action_condition else observation
+            full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action} # if self.policy_action_condition else observation
             unscaled_action, _ = self.predict(full_obs, state, episode_start, deterministic)
             if isinstance(self.actor.action_space, spaces.Box):
                 scaled_action = self.actor.scale_action(unscaled_action)
@@ -683,44 +717,41 @@ class FAST(OffPolicyAlgorithm):
         return return_dict
     
     def sample_base_policy(
-        self, 
-        observation: Union[np.ndarray, th.Tensor, dict[str, Union[np.ndarray, th.Tensor]]], 
+        self,
+        observation: Union[np.ndarray, th.Tensor, dict[str, Union[np.ndarray, th.Tensor]]],
         return_numpy: bool,
     ) -> Union[np.ndarray, th.Tensor]:
         """
-        Helper function to sample action from base diffusion policy only.
-        """        
+        Sample action from base policy. Passes per-key obs dict to the base
+        policy wrapper, which selects its own subset via base_obs_meta.
+        """
         if isinstance(observation, dict):
-            # Remove controller params from environment observation for diffusion policy, if necessary.
-            base_observation_state = observation["state"][..., :-2] if self.control_obs else observation["state"]
-            base_observation_rgb = observation["rgb"]
-            if isinstance(base_observation_state, np.ndarray):
-                base_observation_state = th.as_tensor(base_observation_state, device=self.device, dtype=th.float32)
-            if isinstance(base_observation_rgb, np.ndarray):
-                base_observation_rgb = th.as_tensor(base_observation_rgb, device=self.device, dtype=th.float32)
-            base_observation = {
-                "state": base_observation_state.unsqueeze(1),  # Adding dummy time dimension for diffusion policy.
-                "rgb": base_observation_rgb.unsqueeze(1), # Adding dummy time dimension for diffusion policy.
-            }
+            # Convert each key to numpy for base policy wrapper.
+            base_observation = {}
+            for key, val in observation.items():
+                if isinstance(val, th.Tensor):
+                    base_observation[key] = val.cpu().numpy().astype(np.float32)
+                else:
+                    base_observation[key] = np.asarray(val, dtype=np.float32)
         else:
-            # Remove controller params from environment observation for diffusion policy, if necessary.
-            base_observation = observation[..., :-2] if self.control_obs else observation
-            # noise = th.randn((base_observation.shape[0], self.diffusion_act_chunk, self.diffusion_act_dim), device=self.device)
-            if isinstance(base_observation, np.ndarray):
-                base_observation = th.as_tensor(base_observation, device=self.device, dtype=th.float32)
-        
+            if isinstance(observation, np.ndarray):
+                base_observation = observation.astype(np.float32)
+            else:
+                base_observation = observation.cpu().numpy().astype(np.float32)
+
         base_action = self.diffusion_policy(base_observation, return_numpy=return_numpy)
-        base_action = base_action.reshape(-1, self.diffusion_act_chunk * self.diffusion_act_dim)
-        # Depending on impedance mode, augmenting base action based on controller config.
+        base_action = base_action.reshape(-1, self.chunk_size * self.action_dim)
         if self.policy_impedance_mode != "fixed":
             base_action = self.augment_controller_action(base_action, is_numpy=return_numpy)
-        
-        if return_numpy:
-            base_action = base_action.astype(np.float32)
-        else:
-            base_action = base_action.to(th.float32)
 
-        return base_action
+        if return_numpy:
+            if not isinstance(base_action, np.ndarray):
+                base_action = base_action.cpu().numpy()
+            return base_action.astype(np.float32)
+        else:
+            if isinstance(base_action, np.ndarray):
+                base_action = th.from_numpy(base_action)
+            return base_action.to(device=self.device, dtype=th.float32)
         
     def get_rewards(self, replay_data):
         """
@@ -739,7 +770,7 @@ class FAST(OffPolicyAlgorithm):
         assert self.control_obs, "get_shaped_rewards currently only supports control_obs=True."
         bs = action.shape[0]
 
-        action_gains = action.reshape(bs, self.diffusion_act_chunk, -1)[..., :2]  # Assuming first two dims are gains.
+        action_gains = action.reshape(bs, self.chunk_size, -1)[..., :2]  # Assuming first two dims are gains.
         current_gains = obs[..., -2:]  # Assuming last two dims of obs are current gains.
         
 
@@ -761,7 +792,7 @@ class FAST(OffPolicyAlgorithm):
         assert self.control_obs, "smooth_gain_loss currently only supports control_obs=True."
         bs = actions.shape[0]
 
-        action_gains = actions.reshape(bs, self.diffusion_act_chunk, -1)[..., :2]  # Assuming first two dims are gains.
+        action_gains = actions.reshape(bs, self.chunk_size, -1)[..., :2]  # Assuming first two dims are gains.
         current_gains = observations[..., -2:]  # Assuming last two dims of obs are current gains.
 
         gain_smoothness_penalty = th.cat([
@@ -784,28 +815,28 @@ class FAST(OffPolicyAlgorithm):
 
         # Action shape should be (n_envs, chunk_size * act_dim)
         n_actions = action.shape[0]
-        action = action.reshape(n_actions, self.diffusion_act_chunk, self.diffusion_act_dim)
+        action = action.reshape(n_actions, self.chunk_size, self.action_dim)
         # Creating stiffness action, since it's required for both variable and variable_kp modes.
         if is_numpy:
-            stiffness_action = np.zeros((n_actions, self.diffusion_act_chunk, 1), dtype=np.float32)
+            stiffness_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
         else:
-            stiffness_action = th.zeros((n_actions, self.diffusion_act_chunk, 1), device=action.device, dtype=th.float32)
+            stiffness_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
 
         # Creating damping action, if necessary.
         if self.policy_impedance_mode == "variable":
             if is_numpy:
-                damping_action = np.zeros((n_actions, self.diffusion_act_chunk, 1), dtype=np.float32)
+                damping_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
                 action = np.concatenate([damping_action, stiffness_action, action], axis=-1)
             else:
-                damping_action = th.zeros((n_actions, self.diffusion_act_chunk, 1), device=action.device, dtype=th.float32)
+                damping_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
                 action = th.cat([damping_action, stiffness_action, action], dim=-1)
-            action = action.reshape(n_actions, self.diffusion_act_chunk * (self.diffusion_act_dim + 2))
+            action = action.reshape(n_actions, self.chunk_size * (self.action_dim + 2))
         elif self.policy_impedance_mode == "variable_kp":
             if is_numpy:
                 action = np.concatenate([stiffness_action, action], axis=-1)
             else:
                 action = th.cat([stiffness_action, action], dim=-1)
-            action = action.reshape(n_actions, self.diffusion_act_chunk * (self.diffusion_act_dim + 1))
+            action = action.reshape(n_actions, self.chunk_size * (self.action_dim + 1))
 
         return action
 
