@@ -1,4 +1,5 @@
 import os
+from copy import deepcopy
 from typing import Any, ClassVar, Optional, Tuple, TypeVar, Union
 
 import numpy as np
@@ -363,7 +364,7 @@ class FAST(OffPolicyAlgorithm):
                 self.actor.reset_noise()
 
             # Action by the current actor for the sample state
-            action_dict = self.get_combined_log_prob(replay_data.observations)
+            action_dict = self.get_combined_log_prob(replay_data.observations, base_action=replay_data.base_actions)
             # actions_pi, log_prob = self.actor.action_log_prob(replay_data.observations)
             # log_prob = log_prob.reshape(-1, 1)
             actions_pi = action_dict['final_action']
@@ -392,7 +393,7 @@ class FAST(OffPolicyAlgorithm):
             with th.no_grad():
                 # Select action according to policy
                 # next_actions, next_log_prob = self.actor.action_log_prob(replay_data.next_observations)
-                next_action_dict = self.get_combined_log_prob(replay_data.next_observations)
+                next_action_dict = self.get_combined_log_prob(replay_data.next_observations, base_action=replay_data.next_base_actions)
                 next_actions = th.tensor(self.policy.unscale_action(next_action_dict['final_action'].cpu().numpy())).to(self.device)
                 next_log_prob = next_action_dict['log_prob']
                 # Compute the next Q values: min over all critics targets
@@ -407,7 +408,7 @@ class FAST(OffPolicyAlgorithm):
                 # td error + entropy term
                 target_q_values = self.get_rewards(replay_data) + (1 - replay_data.dones) * self.gamma * next_q_values
                 # target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
-            
+
             # Get current Q-values estimates for each critic network
 			# using action from the replay buffer
             current_q_values = self.critic(self._filter_rl_obs(replay_data.observations), replay_data.actions)
@@ -438,7 +439,7 @@ class FAST(OffPolicyAlgorithm):
                 if self.policy_smooth_gain_lambda > 0.0 and self.policy_impedance_mode != "fixed":
                     smooth_gain_loss = self.smooth_gain_loss(actions_pi, replay_data.observations, self.policy_smooth_gain_lambda)
                     smooth_gain_losses.append(smooth_gain_loss.item())
-    
+
                     # Debugging gradients; only for first gradient step.
                     if self.cfg.debug_gradients and gradient_step == 0:
                         # Backup original actor loss for logging
@@ -518,6 +519,72 @@ class FAST(OffPolicyAlgorithm):
             saved_pytorch_variables = ["ent_coef_tensor"]
         return state_dicts, saved_pytorch_variables
     
+    def _store_transition(
+        self,
+        replay_buffer: ReplayBuffer,
+        buffer_action: np.ndarray,
+        new_obs: Union[np.ndarray, dict[str, np.ndarray]],
+        reward: np.ndarray,
+        dones: np.ndarray,
+        infos: list[dict[str, Any]],
+        mask: Optional[np.ndarray] = None,
+        base_action: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Overridden to cache base-policy actions in the replay buffer. Mirrors SB3's
+        terminal_observation substitution, then calls pi0 once on the (substituted)
+        next_obs so that bootstrap at timeouts uses pi0 of the true final obs.
+        """
+        if self._vec_normalize_env is not None:
+            new_obs_ = self._vec_normalize_env.get_original_obs()
+            reward_ = self._vec_normalize_env.get_original_reward()
+        else:
+            self._last_original_obs, new_obs_, reward_ = self._last_obs, new_obs, reward
+
+        next_obs = deepcopy(new_obs_)
+        for i, done in enumerate(dones):
+            if done and infos[i].get("terminal_observation") is not None:
+                if isinstance(next_obs, dict):
+                    next_obs_ = infos[i]["terminal_observation"]
+                    if self._vec_normalize_env is not None:
+                        next_obs_ = self._vec_normalize_env.unnormalize_obs(next_obs_)
+                    for key in next_obs.keys():
+                        next_obs[key][i] = next_obs_[key]
+                else:
+                    next_obs[i] = infos[i]["terminal_observation"]
+                    if self._vec_normalize_env is not None:
+                        next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])
+
+        next_base_action = self.sample_base_policy(next_obs, return_numpy=True)
+
+        if mask is not None:
+            replay_buffer.add(
+                self._last_original_obs,
+                next_obs,
+                buffer_action,
+                reward_,
+                dones,
+                infos,
+                mask=mask,
+                base_action=base_action,
+                next_base_action=next_base_action,
+            )
+        else:
+            replay_buffer.add(
+                self._last_original_obs,  # type: ignore[arg-type]
+                next_obs,  # type: ignore[arg-type]
+                buffer_action,
+                reward_,
+                dones,
+                infos,
+                base_action=base_action,
+                next_base_action=next_base_action,
+            )
+
+        self._last_obs = new_obs
+        if self._vec_normalize_env is not None:
+            self._last_original_obs = new_obs_
+
     def _sample_action(
             self,
             learning_starts: int,
@@ -569,16 +636,16 @@ class FAST(OffPolicyAlgorithm):
             residual_mag=residual_mag,
         )
         final_action = action_dict['final_action']
+        base_action = action_dict['base_action']
 
         # Checking jump-start logic.
         if self.jumpstart == "random":
             raise NotImplementedError("Random jumpstart not implemented yet.")
         elif self.jumpstart == "curriculum":
-            base_action = action_dict['base_action']
             final_action = np.where(use_base[:, None], base_action, final_action)
-        
+
         buffer_action = final_action # Buffer action is the final combined action.
-        return final_action, buffer_action, use_base
+        return final_action, buffer_action, use_base, base_action
         
     def predict_diffused(
         self,
@@ -621,15 +688,17 @@ class FAST(OffPolicyAlgorithm):
 
     def get_combined_log_prob(
         self,
-        observation: th.Tensor,        
+        observation: th.Tensor,
+        base_action: Optional[th.Tensor] = None,
     ) -> dict[str, th.Tensor]:
         """
-        Helper function to sample actions and log probabilities - needs to preserve computation graph 
-        for gradients, so returns tensors.
+        Helper function to sample actions and log probabilities - needs to preserve computation graph
+        for gradients, so returns tensors. If `base_action` is provided, skips the pi0 call.
         """
         return_dict = {}
-        # First, sample action from base policy.
-        base_action = self.sample_base_policy(observation, return_numpy=False)
+        # First, sample action from base policy (unless a cached one was provided).
+        if base_action is None:
+            base_action = self.sample_base_policy(observation, return_numpy=False)
 
         # Sample action from fast policy.
         full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action} # if self.policy_action_condition else observation
@@ -875,10 +944,10 @@ class FAST(OffPolicyAlgorithm):
                 self.actor.reset_noise(env.num_envs)
 
             # Select action randomly or according to policy
-            actions, buffer_actions, use_base = self._sample_action(learning_starts, action_noise, env.num_envs)
+            actions, buffer_actions, use_base, base_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
             # If jumpstart_buffer is True, don't mask rollout transitions.
             buffer_mask = ~use_base if not self.jumpstart_buffer else None
-            
+
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
 
@@ -896,7 +965,16 @@ class FAST(OffPolicyAlgorithm):
 
             # Store data in replay buffer (normalized action and unnormalized observation)
             # TODO: only do this if we are in learning stage
-            self._store_transition(replay_buffer, buffer_actions, new_obs, rewards, dones, infos, mask=buffer_mask)  # type: ignore[arg-type]
+            self._store_transition(
+                replay_buffer, 
+                buffer_actions, 
+                new_obs, 
+                rewards, 
+                dones, 
+                infos, 
+                mask=buffer_mask, 
+                base_action=base_actions, # next_base_actions handled in _store_transition()
+            )  # type: ignore[arg-type]
 
             self._update_current_progress_remaining(self.num_timesteps, self._total_timesteps)
 

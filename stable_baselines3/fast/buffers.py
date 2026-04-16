@@ -1,7 +1,7 @@
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Generator
-from typing import Any, Optional, Union
+from typing import Any, NamedTuple, Optional, Union
 
 import numpy as np
 import torch as th
@@ -13,6 +13,7 @@ from stable_baselines3.common.type_aliases import (
     DictRolloutBufferSamples,
     ReplayBufferSamples,
     RolloutBufferSamples,
+    TensorDict,
 )
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import VecNormalize
@@ -23,6 +24,26 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+
+class FastReplayBufferSamples(NamedTuple):
+    observations: th.Tensor
+    actions: th.Tensor
+    next_observations: th.Tensor
+    dones: th.Tensor
+    rewards: th.Tensor
+    base_actions: th.Tensor
+    next_base_actions: th.Tensor
+
+
+class FastDictReplayBufferSamples(NamedTuple):
+    observations: TensorDict
+    actions: th.Tensor
+    next_observations: TensorDict
+    dones: th.Tensor
+    rewards: th.Tensor
+    base_actions: th.Tensor
+    next_base_actions: th.Tensor
 
 
 class FastBuffer(ReplayBuffer):
@@ -50,14 +71,19 @@ class FastBuffer(ReplayBuffer):
             raise NotImplementedError("FastBuffer only supports Box observation spaces")
         if not isinstance(self.action_space, spaces.Box):
             raise NotImplementedError("FastBuffer only supports Box action spaces")
-        
+
         # For now, raise error if optimizing memory usage.
         if optimize_memory_usage:
             raise NotImplementedError("FastBuffer does not support memory optimization")
-        
+
         # For now, raise error if offline mix ratio is positive.
         if self.offline_mix_ratio > 0:
             raise NotImplementedError("FastBuffer does not support offline mixing")
+
+        # Cache of base-policy actions to skip pi0 calls inside the gradient loop.
+        # Shape matches self.actions because residual = action_space - base_action, so same dims.
+        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
     
     def size(self) -> int:
         # Total number of transitions stored across all environments.
@@ -77,6 +103,8 @@ class FastBuffer(ReplayBuffer):
         done: np.ndarray,
         infos: Optional[Union[dict, list]] = None,
         mask: Optional[np.ndarray] = None,
+        base_action: Optional[np.ndarray] = None,
+        next_base_action: Optional[np.ndarray] = None,
     ):
         if mask is not None:
             buffer_index = self.pos[mask]
@@ -85,7 +113,7 @@ class FastBuffer(ReplayBuffer):
             mask = np.ones(self.n_envs, dtype=bool)
             buffer_index = self.pos
             env_index = mask
-        
+
         self.observations[buffer_index, env_index] = np.array(obs[mask])
         self.next_observations[buffer_index, env_index] = np.array(next_obs[mask])
         self.actions[buffer_index, env_index] = np.array(action[mask])
@@ -93,15 +121,17 @@ class FastBuffer(ReplayBuffer):
         self.dones[buffer_index, env_index] = np.array(done[mask])
         if self.handle_timeout_termination:
             self.timeouts[buffer_index, env_index] = np.array([info.get("TimeLimit.truncated", False) for info, m in zip(infos, mask) if m])
-        
+        self.base_actions[buffer_index, env_index] = np.array(base_action[mask])
+        self.next_base_actions[buffer_index, env_index] = np.array(next_base_action[mask])
+
         self.pos[mask] += 1
         # Updating full flags and wrapping positions for each env buffer.
         for e in range(self.n_envs):
             if self.pos[e] == self.buffer_size:
                 self.full[e] = True
                 self.pos[e] = 0
-    
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> FastReplayBufferSamples:
         # Modified buffer sampling to uniformly weight all transitions across variably sized environment buffers.
         env_upper_bound = np.where(self.full, self.buffer_size, self.pos)
         env_prob = env_upper_bound / env_upper_bound.sum()
@@ -116,8 +146,10 @@ class FastBuffer(ReplayBuffer):
             # deactivated by default (timeouts is initialized as an array of False)
             (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
             self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+            self.base_actions[batch_inds, env_indices, :],
+            self.next_base_actions[batch_inds, env_indices, :],
         )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+        return FastReplayBufferSamples(*tuple(map(self.to_torch, data)))
     
     def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
         raise ValueError("Should not be called for FastBuffer")
@@ -179,6 +211,11 @@ class DictFastBuffer(FastBuffer):
         self.rewards = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
 
+        # Cache of base-policy actions to skip pi0 calls inside the gradient loop.
+        # Shape matches self.actions because residual = action_space - base_action, so same dims.
+        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
         self.handle_timeout_termination = handle_timeout_termination
@@ -214,6 +251,8 @@ class DictFastBuffer(FastBuffer):
         done: np.ndarray,
         infos: Optional[Union[dict, list]] = None,
         mask: Optional[np.ndarray] = None,
+        base_action: Optional[np.ndarray] = None,
+        next_base_action: Optional[np.ndarray] = None,
     ):
         if mask is not None:
             buffer_index = self.pos[mask]
@@ -222,7 +261,7 @@ class DictFastBuffer(FastBuffer):
             mask = np.ones(self.n_envs, dtype=bool)
             buffer_index = self.pos
             env_index = mask
-        
+
         # Copy to avoid modification by reference
         for key in self.observations.keys():
             self.observations[key][buffer_index, env_index] = np.array(obs[key][mask])
@@ -232,7 +271,9 @@ class DictFastBuffer(FastBuffer):
         self.dones[buffer_index, env_index] = np.array(done[mask])
         if self.handle_timeout_termination:
             self.timeouts[buffer_index, env_index] = np.array([info.get("TimeLimit.truncated", False) for info, m in zip(infos, mask) if m])
-        
+        self.base_actions[buffer_index, env_index] = np.array(base_action[mask])
+        self.next_base_actions[buffer_index, env_index] = np.array(next_base_action[mask])
+
         self.pos[mask] += 1
         # Updating full flags and wrapping positions for each env buffer.
         for e in range(self.n_envs):
@@ -240,7 +281,7 @@ class DictFastBuffer(FastBuffer):
                 self.full[e] = True
                 self.pos[e] = 0
 
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> DictReplayBufferSamples:
+    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> FastDictReplayBufferSamples:
         # Modified buffer sampling to uniformly weight all transitions across variably sized environment buffers.
         env_upper_bound = np.where(self.full, self.buffer_size, self.pos)
         env_prob = env_upper_bound / env_upper_bound.sum()
@@ -252,7 +293,7 @@ class DictFastBuffer(FastBuffer):
         obs = self._normalize_obs(obs, env)
         next_obs = self._normalize_obs(next_obs, env)
 
-        return DictReplayBufferSamples(
+        return FastDictReplayBufferSamples(
             observations={key: self.to_torch(o) for key, o in obs.items()},
             actions=self.to_torch(self.actions[batch_inds, env_indices, :]),
             next_observations={key: self.to_torch(no) for key, no in next_obs.items()},
@@ -260,4 +301,6 @@ class DictFastBuffer(FastBuffer):
             # deactivated by default (timeouts is initialized as an array of False)
             dones=self.to_torch((self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1)),
             rewards=self.to_torch(self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env)),
+            base_actions=self.to_torch(self.base_actions[batch_inds, env_indices, :]),
+            next_base_actions=self.to_torch(self.next_base_actions[batch_inds, env_indices, :]),
         )
