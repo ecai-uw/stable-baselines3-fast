@@ -831,35 +831,13 @@ class FAST(OffPolicyAlgorithm):
         For clarity, should type replay_data argument: dict or ReplayBufferSamples?
         """
         if self.shape_rewards:
-            # rewards = replay_data.rewards + \
-            #       self.gamma * self.base_critic_value.forward_v(replay_data.next_observations).detach() - \
-            #       self.base_critic_value.forward_v(replay_data.observations).detach()
             rewards = replay_data.rewards + self.get_shaped_rewards(replay_data.actions, replay_data.observations)
         else:
             rewards = replay_data.rewards
         return rewards
 
     def get_shaped_rewards(self, action, obs):
-        assert self.control_obs, "get_shaped_rewards currently only supports control_obs=True."
-        bs = action.shape[0]
-
-        action_gains = action.reshape(bs, self.chunk_size, -1)[..., :2]  # Assuming first two dims are gains.
-        current_gains = obs[..., -2:]  # Assuming last two dims of obs are current gains.
-        
-
-        gain_smoothness_penalty = th.cat([
-            current_gains.unsqueeze(1) - 2 * action_gains[:, [0], :] + action_gains[:, [1], :], # inter-chunk penalty
-            action_gains[:, 0:-2, :] - 2 * action_gains[:, 1:-1, :] + action_gains[:, 2:, :], # intra-chunk penalty
-        ], dim=1)
-        gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean(dim=(1, 2), keepdim=False)
-        shaped_reward = (1.0 - th.tanh(gain_smoothness_penalty)) * 1.0
-        # gain_smoothness_penalty = current_gains - 2 * action_gains[:, 0, :] + action_gains[:, 1, :]
-
-
-        # gain_smoothness_penalty = action_gains[:, 0:-2, :] - 2 * action_gains[:, 1:-1, :] + action_gains[:, 2:, :]
-        # gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean(dim=(1, 2), keepdim=False)
-        # shaped_reward = (1.0 - th.tanh(gain_smoothness_penalty)) * 1.0
-        return shaped_reward
+        return -self.cfg.policy.time_penalty
     
     def smooth_gain_loss(self, actions, observations, smooth_gain_lambda):
         assert self.control_obs, "smooth_gain_loss currently only supports control_obs=True."
