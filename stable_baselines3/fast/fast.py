@@ -235,12 +235,8 @@ class FAST(OffPolicyAlgorithm):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        # Setting replay buffer class.
-        if self.cfg.env.use_image_obs:
-            self.replay_buffer_class = DictFastBuffer
-        else:
-            self.replay_buffer_class = FastBuffer
-
+        # Setting replay buffer.
+        self.replay_buffer_class = DictFastBuffer
         self.replay_buffer = self.replay_buffer_class(
             self.buffer_size,
             self.observation_space,
