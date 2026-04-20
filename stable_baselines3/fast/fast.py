@@ -168,8 +168,8 @@ class FAST(OffPolicyAlgorithm):
         self.cfg = cfg
 
         self.diffusion_policy = diffusion_policy
-        self.chunk_size = cfg.base_policy.chunk_size
-        self.action_dim = cfg.base_policy.action_dim
+        # self.chunk_size = cfg.base_policy.chunk_size
+        # self.action_dim = cfg.base_policy.action_dim
         self.critic_backup_combine_type = critic_backup_combine_type
 
         # This will only be used for jumpstart curriculum, and will be overwritten by load mdel.
@@ -180,11 +180,14 @@ class FAST(OffPolicyAlgorithm):
         
     def _setup_model(self) -> None:
         # Extracting base policy config params.
+        self.chunk_size = self.cfg.base_policy.chunk_size
+        self.action_dim = self.cfg.base_policy.action_dim
+
+        # Extracting RL policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
         self.policy_gains_only = self.cfg.policy.gains_only
         self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
-        # self.policy_action_condition = self.cfg.policy.action_condition
         self.shape_rewards = self.cfg.policy.shape_rewards
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
@@ -226,9 +229,6 @@ class FAST(OffPolicyAlgorithm):
         self.controller_configs = self.cfg.controller
         assert self.policy_impedance_mode == self.controller_configs.impedance_mode, "Controller impedance mode in cfg.controller must match cfg.policy.impedance_mode"
 
-        # Observation meta for processing observations.
-        # self.observation_meta = self.cfg.observation_meta
-
         # Inline super()._setup_model() so buffer and policy get different obs spaces.
         # Buffer stores the full env obs (all keys incl. base policy's images).
         # Policy (actor/critic) only sees the RL subset.
@@ -263,8 +263,6 @@ class FAST(OffPolicyAlgorithm):
             features_extractor_class = partial(CombinedExtractor, normalized_image=True)
         else:
             features_extractor_class = FlattenExtractor
-        # if self.policy_action_condition:
-        # TODO: clean this up
         self.policy_class = partial(
             ResidualSACPolicy,
             features_extractor_class=features_extractor_class,
@@ -701,7 +699,7 @@ class FAST(OffPolicyAlgorithm):
             base_action = self.sample_base_policy(observation, return_numpy=False)
 
         # Sample action from fast policy.
-        full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action} # if self.policy_action_condition else observation
+        full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action}
         scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
         
         # Combine base action and fast policy action.
@@ -759,7 +757,7 @@ class FAST(OffPolicyAlgorithm):
                 scaled_action = unscaled_action
         else:
             # Use predict() otherwise; this unsquashes, so re-scale if needed.
-            full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action} # if self.policy_action_condition else observation
+            full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action}
             unscaled_action, _ = self.predict(full_obs, state, episode_start, deterministic)
             if isinstance(self.actor.action_space, spaces.Box):
                 scaled_action = self.actor.scale_action(unscaled_action)
