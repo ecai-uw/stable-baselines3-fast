@@ -175,6 +175,11 @@ class FAST(OffPolicyAlgorithm):
         # This will only be used for jumpstart curriculum, and will be overwritten by load mdel.
         self.jumpstart_stage = 1
 
+        # Per-env ephemeral state for jumpstart="random"; lazy-seeded in collect_rollouts
+        # and excluded from save so resumed old checkpoints simply re-seed on next rollout.
+        self._random_thresholds: Optional[np.ndarray] = None
+        self._prev_dones: Optional[np.ndarray] = None
+
         if _init_setup_model:
             self._setup_model()
         
@@ -212,7 +217,7 @@ class FAST(OffPolicyAlgorithm):
         else:
             self.jumpstart_buffer = True
         
-        if self.jumpstart == "curriculum":
+        if self.jumpstart in ("curriculum", "random"):
             base_stats_path = self.cfg.base_stats_path
             if "simple_reset" in self.cfg.env and self.cfg.env.simple_reset:
                 base, ext = os.path.splitext(base_stats_path)
@@ -505,7 +510,10 @@ class FAST(OffPolicyAlgorithm):
         )
     
     def _excluded_save_params(self) -> list[str]:
-        return super()._excluded_save_params() + ["actor", "critic", "critic_target", "diffusion_policy"] # noqa: RUF005
+        return super()._excluded_save_params() + [
+            "actor", "critic", "critic_target", "diffusion_policy",
+            "_random_thresholds", "_prev_dones",
+        ] # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         # Standard SAC save parameters.
@@ -614,14 +622,18 @@ class FAST(OffPolicyAlgorithm):
 
         # Handling jumpstart logic.
         if self.jumpstart == "random":
-            # TODO: might have to do this on the env side
-            raise NotImplementedError("Random jumpstart not implemented yet.")
+            # Per-env handoff thresholds are sampled per-episode in collect_rollouts
+            # (see self._random_thresholds). Each env uses base policy while its step
+            # count is below its sampled threshold, residual policy after.
+            env_step_count = np.array(self.env.env_method("get_step_count"))
+            use_base = env_step_count < self._random_thresholds
+            residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
         elif self.jumpstart == "curriculum":
             env_step_count = np.array(self.env.env_method("get_step_count"))
             horizon_threshold = (1.0 - (self.jumpstart_stage) / self.jumpstart_n) * self.base_avg_horizon * self.chunk_size
             use_base = env_step_count < horizon_threshold
             # TODO: for now, automatically use full residual mag for jsrl
-            residual_mag = 1.0 
+            residual_mag = 1.0
         else:
             # Setting residual scale based on residual scale schedule.
             use_base = np.zeros(n_envs, dtype=bool)
@@ -637,9 +649,7 @@ class FAST(OffPolicyAlgorithm):
         base_action = action_dict['base_action']
 
         # Checking jump-start logic.
-        if self.jumpstart == "random":
-            raise NotImplementedError("Random jumpstart not implemented yet.")
-        elif self.jumpstart == "curriculum":
+        if self.jumpstart in ("random", "curriculum"):
             final_action = np.where(use_base[:, None], base_action, final_action)
 
         buffer_action = final_action # Buffer action is the final combined action.
@@ -908,6 +918,20 @@ class FAST(OffPolicyAlgorithm):
                 # Sample a new noise matrix
                 self.actor.reset_noise(env.num_envs)
 
+            # For jumpstart="random": lazy-seed per-env handoff thresholds on first
+            # iteration, and resample for any env that finished an episode on the
+            # previous step. Ephemeral state (not saved), rebuilt on resume.
+            if self.jumpstart == "random":
+                hi = self.base_avg_horizon * self.chunk_size
+                if self._random_thresholds is None:
+                    self._random_thresholds = np.random.uniform(0, hi, size=env.num_envs)
+                    self._prev_dones = np.zeros(env.num_envs, dtype=bool)
+                elif self._prev_dones.any():
+                    reset_mask = self._prev_dones
+                    self._random_thresholds[reset_mask] = np.random.uniform(
+                        0, hi, size=int(reset_mask.sum())
+                    )
+
             # Select action randomly or according to policy
             actions, buffer_actions, use_base, base_actions = self._sample_action(learning_starts, action_noise, env.num_envs)
             # If jumpstart_buffer is True, don't mask rollout transitions.
@@ -915,6 +939,11 @@ class FAST(OffPolicyAlgorithm):
 
             # Rescale and perform action
             new_obs, rewards, dones, infos = env.step(actions)
+
+            # Cache dones so the next iteration can resample thresholds for envs
+            # whose episodes just ended (get_step_count() resets to 0 on env reset).
+            if self.jumpstart == "random":
+                self._prev_dones = dones.copy()
 
             self.num_timesteps += env.num_envs
             num_collected_steps += 1
