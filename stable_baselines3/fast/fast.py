@@ -188,6 +188,15 @@ class FAST(OffPolicyAlgorithm):
         self.chunk_size = self.cfg.base_policy.chunk_size
         self.action_dim = self.cfg.base_policy.action_dim
 
+        # Whether RL emits a single-step residual (with the base policy still chunked).
+        # When False, RL emits a chunk_size-length residual, matching legacy behavior.
+        self.rl_single_step = bool(self.cfg.rl_single_step) if "rl_single_step" in self.cfg else False
+
+        # Per-rollout base-policy chunk cache (single-step path only).
+        # idx == chunk_size is the "needs refill" sentinel for the first call.
+        self._base_chunk_cache: Optional[np.ndarray] = None
+        self._chunk_step_idx = self.chunk_size
+
         # Extracting RL policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
@@ -278,6 +287,7 @@ class FAST(OffPolicyAlgorithm):
             gains_mag=self.gains_mag,
             chunk_size=self.chunk_size,
             diffusion_act_dim=self.action_dim,
+            rl_single_step=self.rl_single_step,
         )
         
         self.policy = self.policy_class(
@@ -561,7 +571,14 @@ class FAST(OffPolicyAlgorithm):
                     if self._vec_normalize_env is not None:
                         next_obs[i] = self._vec_normalize_env.unnormalize_obs(next_obs[i, :])
 
-        next_base_action = self.sample_base_policy(next_obs, return_numpy=True)
+        if self.rl_single_step:
+            # Force a refill on any done so the next-state base action is conditioned
+            # on the post-reset obs. Mid-chunk this also re-anchors all envs' chunks.
+            next_base_action = self.peek_next_base_action(
+                next_obs, force_refill=bool(np.any(dones))
+            )
+        else:
+            next_base_action = self.sample_base_policy(next_obs, return_numpy=True)
 
         if mask is not None:
             replay_buffer.add(
@@ -742,7 +759,12 @@ class FAST(OffPolicyAlgorithm):
     ) -> dict[str, np.ndarray]:
         return_dict = {}
         # First, sample action from base policy.
-        base_action = self.sample_base_policy(observation, return_numpy=True)
+        # Single-step path: pop one action from the cached chunk (refilled as needed).
+        # Chunked path: return the full chunk flattened to (B, chunk_size * act_dim_eff).
+        if self.rl_single_step:
+            base_action = self.get_next_base_action(observation)
+        else:
+            base_action = self.sample_base_policy(observation, return_numpy=True)
         return_dict['base_action'] = base_action
 
         # If sample_base is True, return only the base action as the final action.
@@ -830,6 +852,56 @@ class FAST(OffPolicyAlgorithm):
                 base_action = th.from_numpy(base_action)
             return base_action.to(device=self.device, dtype=th.float32)
         
+    def reset_base_cache(self):
+        """Invalidate the single-step base-policy chunk cache.
+
+        Call between contexts that independently drive the base policy (e.g.
+        between training rollouts and eval episodes, where batch shapes and obs
+        distributions differ). After reset, the next `get_next_base_action` /
+        `peek_next_base_action` call will refill.
+        """
+        self._base_chunk_cache = None
+        self._chunk_step_idx = self.chunk_size
+
+    def _refill_base_chunk_cache(self, observation):
+        """Query the base policy on `observation` and overwrite the cache for all envs.
+
+        Resets the global step idx to 0. Used by both `get_next_base_action` and
+        `peek_next_base_action` — refill events are shared across all envs (lockstep
+        replan), so cache semantics match whether the trigger is a chunk boundary or
+        a mid-chunk episode reset in any env.
+        """
+        chunk = self.sample_base_policy(observation, return_numpy=True)
+        # (n_envs, chunk_size * act_dim_eff) -> (n_envs, chunk_size, act_dim_eff)
+        act_dim_eff = chunk.shape[-1] // self.chunk_size
+        self._base_chunk_cache = chunk.reshape(-1, self.chunk_size, act_dim_eff)
+        self._chunk_step_idx = 0
+
+    def get_next_base_action(self, observation):
+        """Single-step path: return the current chunk slot and advance idx.
+
+        Refills the cache from `observation` when the previous iteration exhausted
+        the chunk or flagged a forced refill (e.g. via `peek_next_base_action` on a
+        done transition).
+        """
+        if self._chunk_step_idx >= self.chunk_size:
+            self._refill_base_chunk_cache(observation)
+        action = self._base_chunk_cache[:, self._chunk_step_idx, :].copy()
+        self._chunk_step_idx += 1
+        return action
+
+    def peek_next_base_action(self, observation, force_refill: bool = False):
+        """Single-step path: return the *upcoming* chunk slot without advancing idx.
+
+        Used by `_store_transition` for `next_base_action`. If `force_refill` (any
+        env reset this step) or the chunk is exhausted, eagerly refills from
+        `observation` so the returned action is conditioned on the new episode's
+        obs and the next rollout iteration is a cache hit.
+        """
+        if force_refill or self._chunk_step_idx >= self.chunk_size:
+            self._refill_base_chunk_cache(observation)
+        return self._base_chunk_cache[:, self._chunk_step_idx, :].copy()
+
     def get_rewards(self, replay_data):
         """
         For clarity, should type replay_data argument: dict or ReplayBufferSamples?
@@ -899,6 +971,12 @@ class FAST(OffPolicyAlgorithm):
         """
         # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
+
+        # Fresh rollout batch — drop any chunk cache populated by a previous eval
+        # (which may have run at a different n_envs) or a previous rollout that
+        # ended mid-chunk.
+        if self.rl_single_step:
+            self.reset_base_cache()
 
         num_collected_steps, num_collected_episodes = 0, 0
 

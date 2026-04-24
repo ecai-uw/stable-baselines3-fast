@@ -259,6 +259,7 @@ class ResidualSACPolicy(SACPolicy):
         gains_mag: float = 0.2,
         chunk_size: int = 1, # TODO: rename this to diffusion_chunk_size
         diffusion_act_dim: int = 1, # TODO: rename this to diffusion_act_dim
+        rl_single_step: bool = False,
     ):
         self.policy_type = policy_type
         self.chunk_size = chunk_size
@@ -267,6 +268,11 @@ class ResidualSACPolicy(SACPolicy):
         self.gains_only = gains_only
         self.residual_mag = residual_mag
         self.gains_mag = gains_mag
+        self.rl_single_step = rl_single_step
+        # RL residual is one-per-step under single-step; full chunk otherwise.
+        # action_space already reflects this width (set by the env stack), so
+        # reshape(..., effective_rl_chunk, act_dim) round-trips correctly.
+        self.effective_rl_chunk = 1 if rl_single_step else chunk_size
 
         # Getting true action dimension based on impedance mode.
         if self.impedance_mode == "fixed":
@@ -309,8 +315,8 @@ class ResidualSACPolicy(SACPolicy):
             # For residual + scale policy, add extra dimension to action space.
             actor_action_space = self.actor_kwargs["action_space"]
             self.actor_kwargs["action_space"] = spaces.Box(
-                low=np.concatenate([actor_action_space.low, np.array([-1.0] * self.chunk_size)], axis=0),
-                high=np.concatenate([actor_action_space.high, np.array([1.0] * self.chunk_size)], axis=0),
+                low=np.concatenate([actor_action_space.low, np.array([-1.0] * self.effective_rl_chunk)], axis=0),
+                high=np.concatenate([actor_action_space.high, np.array([1.0] * self.effective_rl_chunk)], axis=0),
                 dtype=actor_action_space.dtype,
             )
         else:
@@ -391,7 +397,8 @@ class ResidualSACPolicy(SACPolicy):
         use_numpy: bool = True,
     ):
         # Temporarily re-shaping residual action for processing.
-        scaled_action = scaled_action.reshape(-1, self.chunk_size, self.act_dim)
+        # effective_rl_chunk == 1 under single-step (no-op reshape); == chunk_size otherwise.
+        scaled_action = scaled_action.reshape(-1, self.effective_rl_chunk, self.act_dim)
 
         # If gains only, zero out residual for delta position and orientation.
         if self.gains_only and self.impedance_mode != "fixed":
@@ -421,7 +428,7 @@ class ResidualSACPolicy(SACPolicy):
             scaled_action = th.cat([action_gains_clamped, action_residual_clamped], dim=-1)
 
         # Re-shape actions back.
-        scaled_action = scaled_action.reshape(-1, self.chunk_size * self.act_dim)
+        scaled_action = scaled_action.reshape(-1, self.effective_rl_chunk * self.act_dim)
 
         if self.policy_type == "residual":
             # NOTE: this assumes action space is normalized to [-1, 1]
