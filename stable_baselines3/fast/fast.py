@@ -171,6 +171,10 @@ class FAST(OffPolicyAlgorithm):
         # self.chunk_size = cfg.base_policy.chunk_size
         # self.action_dim = cfg.base_policy.action_dim
         self.critic_backup_combine_type = critic_backup_combine_type
+        # Diagnostic toggle: drop the SAC entropy bonus from the critic backup
+        # while leaving actor / α-autotune unchanged. Defaults to True for
+        # backwards compatibility with older configs.
+        self.critic_entropy_bonus = bool(self.cfg.train.get("critic_entropy_bonus", True)) if self.cfg else True
 
         # This will only be used for jumpstart curriculum, and will be overwritten by load mdel.
         self.jumpstart_stage = 1
@@ -417,7 +421,8 @@ class FAST(OffPolicyAlgorithm):
                 elif self.critic_backup_combine_type == 'mean':
                     next_q_values = th.mean(next_q_values, dim=1, keepdim=True)
                 # add entropy term
-                next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
+                if self.critic_entropy_bonus:
+                    next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
                 target_q_values = self.get_rewards(replay_data) + (1 - replay_data.dones) * self.gamma * next_q_values
                 # target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
