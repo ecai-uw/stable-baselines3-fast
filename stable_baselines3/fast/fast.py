@@ -168,13 +168,24 @@ class FAST(OffPolicyAlgorithm):
         self.cfg = cfg
 
         self.diffusion_policy = diffusion_policy
-        # self.chunk_size = cfg.base_policy.chunk_size
-        # self.action_dim = cfg.base_policy.action_dim
         self.critic_backup_combine_type = critic_backup_combine_type
         # Diagnostic toggle: drop the SAC entropy bonus from the critic backup
         # while leaving actor / α-autotune unchanged. Defaults to True for
         # backwards compatibility with older configs.
         self.critic_entropy_bonus = bool(self.cfg.train.get("critic_entropy_bonus", True)) if self.cfg else True
+        # REDQ-style critic ensemble: target uses min over a random subset of size
+        # min_q_heads. Actor loss aggregation is controlled by policy_gradient_type;
+        # None falls back to the legacy critic_backup_combine_type behavior.
+        # Currently the only supported non-None value is "ensemble_mean".
+        self.min_q_heads = self.cfg.train.get("min_q_heads", None) if self.cfg else None
+        self.policy_gradient_type = self.cfg.train.get("policy_gradient_type", None) if self.cfg else None
+        if self.policy_gradient_type is not None and self.policy_gradient_type != "ensemble_mean":
+            raise ValueError(
+                f"Unsupported policy_gradient_type={self.policy_gradient_type!r}; "
+                f"valid options are None or 'ensemble_mean'."
+            )
+        # Optional gradient clipping (max-norm) applied before each optimizer.step().
+        self.grad_clip_norm = self.cfg.train.get("grad_clip_norm", None) if self.cfg else None
 
         # This will only be used for jumpstart curriculum, and will be overwritten by load mdel.
         self.jumpstart_stage = 1
@@ -415,11 +426,18 @@ class FAST(OffPolicyAlgorithm):
                 next_log_prob = next_action_dict['log_prob']
                 # Compute the next Q values: min over all critics targets
                 next_q_values = th.cat(self.critic_target(self._filter_rl_obs(replay_data.next_observations), next_actions), dim=1)
-                next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                if self.critic_backup_combine_type == 'min':
+                if self.min_q_heads is not None:
+                    # REDQ-style target: min over a random subset of size min_q_heads.
+                    n_critics = next_q_values.shape[1]
+                    m = min(int(self.min_q_heads), n_critics)
+                    idx = th.randperm(n_critics, device=next_q_values.device)[:m]
+                    next_q_values = th.min(next_q_values.index_select(1, idx), dim=1, keepdim=True).values
+                else:
                     next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                elif self.critic_backup_combine_type == 'mean':
-                    next_q_values = th.mean(next_q_values, dim=1, keepdim=True)
+                    if self.critic_backup_combine_type == 'min':
+                        next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
+                    elif self.critic_backup_combine_type == 'mean':
+                        next_q_values = th.mean(next_q_values, dim=1, keepdim=True)
                 # add entropy term
                 if self.critic_entropy_bonus:
                     next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
@@ -439,6 +457,8 @@ class FAST(OffPolicyAlgorithm):
             # Optimize the critic
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
+            if self.grad_clip_norm is not None:
+                th.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_clip_norm)
             self.critic.optimizer.step()
 
             if gradient_step in actor_gradient_idx:
@@ -446,7 +466,9 @@ class FAST(OffPolicyAlgorithm):
 				# Alternative: actor_loss = th.mean(log_prob - qf1_pi)
 				# Min over all critic networks
                 q_values_pi = th.cat(self.critic(self._filter_rl_obs(replay_data.observations), actions_pi), dim=1)
-                if self.critic_backup_combine_type == 'min':
+                if self.policy_gradient_type == 'ensemble_mean':
+                    min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
+                elif self.critic_backup_combine_type == 'min':
                     min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
                 elif self.critic_backup_combine_type == 'mean':
                     min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
@@ -482,11 +504,15 @@ class FAST(OffPolicyAlgorithm):
                         final_actor_loss = actor_loss + smooth_gain_loss
                         self.actor.optimizer.zero_grad()
                         final_actor_loss.backward()
+                    if self.grad_clip_norm is not None:
+                        th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
                     self.actor.optimizer.step()
                 else:
                     # Optimize the actor with actor loss only.
                     self.actor.optimizer.zero_grad()
                     actor_loss.backward()
+                    if self.grad_clip_norm is not None:
+                        th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
                     self.actor.optimizer.step()
 
             # Update target networks
