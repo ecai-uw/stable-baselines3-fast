@@ -215,7 +215,6 @@ class FAST(OffPolicyAlgorithm):
         # Extracting RL policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
-        self.policy_gains_only = self.cfg.policy.gains_only
         self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
         self.shape_rewards = self.cfg.policy.shape_rewards
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
@@ -297,7 +296,6 @@ class FAST(OffPolicyAlgorithm):
             features_extractor_class=features_extractor_class,
             policy_type=self.policy_type,
             impedance_mode=self.policy_impedance_mode,
-            gains_only=self.policy_gains_only,
             residual_mag=self.residual_mag,
             gains_mag=self.gains_mag,
             chunk_size=self.chunk_size,

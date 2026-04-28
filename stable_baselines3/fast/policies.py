@@ -254,18 +254,16 @@ class ResidualSACPolicy(SACPolicy):
         standard_gauss_init: bool = False,
         policy_type: str = "residual",
         impedance_mode: str = "fixed",
-        gains_only: bool = False,
         residual_mag: float = 0.2,
         gains_mag: float = 0.2,
-        chunk_size: int = 1, # TODO: rename this to diffusion_chunk_size
-        diffusion_act_dim: int = 1, # TODO: rename this to diffusion_act_dim
+        chunk_size: int = 1,
+        diffusion_act_dim: int = 1,
         rl_single_step: bool = False,
     ):
         self.policy_type = policy_type
         self.chunk_size = chunk_size
         self.diffusion_act_dim = diffusion_act_dim
         self.impedance_mode = impedance_mode
-        self.gains_only = gains_only
         self.residual_mag = residual_mag
         self.gains_mag = gains_mag
         self.rl_single_step = rl_single_step
@@ -400,29 +398,15 @@ class ResidualSACPolicy(SACPolicy):
         # effective_rl_chunk == 1 under single-step (no-op reshape); == chunk_size otherwise.
         scaled_action = scaled_action.reshape(-1, self.effective_rl_chunk, self.act_dim)
 
-        # If gains only, zero out residual for delta position and orientation.
-        if self.gains_only and self.impedance_mode != "fixed":
-            if use_numpy:
-                scaled_action[..., 2:] *= 0.0
-            else:
-                # if using torch, preserve gradient
-                mask = th.ones_like(scaled_action)
-                mask[..., 2:] = 0.0
-                scaled_action = scaled_action * mask
-
         # Scaling/clamping gains and residuals separately.
         residual_bounds = residual_mag_scale * self.residual_mag
         gains_bounds = residual_mag_scale * self.gains_mag
 
-        # TODO: INSTEAD OF CLAMPING RESIDUALS, SCALE THEM INSTEAD.
+        # For torch, preserve gradient instead of modifying in-place.
         if use_numpy:
-            # scaled_action[..., :2] = np.clip(scaled_action[..., :2], -gains_bounds, gains_bounds)
-            # scaled_action[..., 2:] = np.clip(scaled_action[..., 2:], -residual_bounds, residual_bounds)
             scaled_action[..., :2] *= gains_bounds
             scaled_action[..., 2:] *= residual_bounds
         else:
-            # action_gains_clamped = th.clamp(scaled_action[..., :2], -gains_bounds, gains_bounds)
-            # action_residual_clamped = th.clamp(scaled_action[..., 2:], -residual_bounds, residual_bounds)
             action_gains_clamped = scaled_action[..., :2] * gains_bounds
             action_residual_clamped = scaled_action[..., 2:] * residual_bounds
             scaled_action = th.cat([action_gains_clamped, action_residual_clamped], dim=-1)
@@ -442,122 +426,3 @@ class ResidualSACPolicy(SACPolicy):
             }
         else:
             raise NotImplementedError()
-
-        breakpoint()
-        # If gains only, zero out residual for delta position and orientation.
-        if self.gains_only and self.impedance_mode != "fixed":
-            scaled_action = scaled_action.reshape(-1, self.chunk_size, self.act_dim + 2)
-            # if using torch, preserve gradient
-            if not use_numpy:
-                mask = th.ones_like(scaled_action)
-                mask[..., 2:] = 0.0
-                scaled_action = scaled_action * mask
-            # Other wise, just modify in-place
-            else:
-                scaled_action[..., 2:] *= 0.0
-            scaled_action = scaled_action.reshape(-1, self.chunk_size * (self.act_dim + 2))
-        # TODO: DON'T CLAMP THE CONTROL PARAMS
-        # TODO: FOR EFFICIENCY, ONLY AUGMENT BASE ACTIONS IF WE'RE NOT SAMPLIGN HTE RESIDUAL POLICY
-        # TOOD: in other words, functions in fast.py should check if sample_base=True; if it is, then call augment...
-        # Scale action (clip residuals based on residual magnitude).
-        if self.policy_type == "residual":
-            # NOTE: this assumes action space is normalized to [-1, 1]
-            if use_numpy:
-                scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
-                final_action = np.clip(base_action + scaled_action, -1.0, 1.0)
-            else:
-                scaled_action = th.clamp(scaled_action, -residual_mag, residual_mag)
-                final_action = th.clamp(base_action + scaled_action, -1.0, 1.0)
-            return {
-                "scaled_action": scaled_action,
-                "final_action": final_action,
-            }
-
-        elif self.policy_type in ["residual_scale", "residual_force"]:
-            raise NotImplementedError()
-            # NOTE: this assumes unscaled action space is centered at 0...
-            # ... which is NOT true for orientation....
-            # but for now we are only scaling delta xyz
-            # action_min = np.array([-1, -1, -1, -0.5288763, -1, -0.92734307, -1])
-            # action_max = np.array([1, 1, 1, 0.62915826, 1, 0.42358947, 1 ])
-            # zero_action = -action_min / (action_max - action_min) * 2 - 1
-            # delta_action = np.array([0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0])
-            # NOTE: THIS ASSUMES DELTA EEF ACTION SPACE
-            if use_numpy:
-                # Clamp residuals and scales with the same bounds. TODO: separate?
-                scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
-                pred_residual = scaled_action[:, :self.chunk_size * self.act_dim]
-                pred_scale = scaled_action[:, -self.chunk_size:]
-                if self.policy_type == "residual_force":
-                    # Force scale to speed up.
-                    pred_scale = np.maximum(pred_scale, 0.1)
-
-                # Scaling final delta action.
-                final_action = (base_action + pred_residual).reshape(-1, self.chunk_size, self.act_dim)
-                pred_scale = pred_scale.reshape(-1, self.chunk_size, 1)
-                final_action[:, :, 0:3] *= np.power(MAX_ACTION_SCALE, pred_scale) # only scale position
-                final_action = final_action.reshape(-1, self.chunk_size * self.act_dim)
-                final_action = np.clip(final_action, -1.0, 1.0)
-            else:
-                # Clamp residuals and scales with the same bounds. TODO: separate?
-                scaled_action = th.clamp(scaled_action, -residual_mag, residual_mag)
-                pred_residual = scaled_action[:, :self.chunk_size * self.act_dim]
-                pred_scale = scaled_action[:, -self.chunk_size:]
-                if self.policy_type == "residual_force":
-                    # Force scale to speed up.
-                    pred_scale = th.maximum(pred_scale, th.tensor(0.1, device=pred_scale.device))
-
-                # Scaling finsal delta action.
-                final_action = (base_action + pred_residual).view(-1, self.chunk_size, self.act_dim)
-                pred_scale = pred_scale.view(-1, self.chunk_size, 1)
-                final_action[:, :, 0:3] *= th.pow(MAX_ACTION_SCALE, pred_scale) # only scale position
-                final_action = final_action.view(-1, self.chunk_size * self.act_dim)
-                final_action = th.clamp(final_action, -1.0, 1.0)
-            
-            return {
-                "scaled_action": scaled_action,
-                "final_action": final_action,
-                "predict_second_return": pred_scale,
-            }
-        
-        elif self.policy_type in ["residual_scale2", "residual_force2"]:
-            # Scale first, then apply residual.
-            if use_numpy:
-                # Clamp residuals and scales with the same bounds. TODO: separate?
-                scaled_action = np.clip(scaled_action, -residual_mag, residual_mag)
-                pred_residual = scaled_action[:, :self.chunk_size * self.act_dim]
-                pred_scale = scaled_action[:, -self.chunk_size:]
-                if self.policy_type == "residual_force2":
-                    # Force scale to speed up.
-                    pred_scale = np.maximum(pred_scale, 0.1)
-                
-                # Scaling final delta action.
-                final_action = base_action.reshape(-1, self.chunk_size, self.act_dim)
-                pred_scale = pred_scale.reshape(-1, self.chunk_size, 1)
-                final_action[:, :, 0:3] *= np.power(MAX_ACTION_SCALE, pred_scale) # only scale position
-                final_action = final_action.reshape(-1, self.chunk_size * self.act_dim)
-                final_action = final_action + pred_residual
-                final_action = np.clip(final_action, -1.0, 1.0)
-            else:
-                # Clamp residuals and scales with the same bounds. TODO: separate?
-                scaled_action = th.clamp(scaled_action, -residual_mag, residual_mag)
-                pred_residual = scaled_action[:, :self.chunk_size * self.act_dim]
-                pred_scale = scaled_action[:, -self.chunk_size:]
-                if self.policy_type == "residual_force2":
-                    # Force scale to speed up.
-                    pred_scale = th.maximum(pred_scale, th.tensor(0.1, device=pred_scale.device))
-                
-                # Scaling finsal delta action.
-                final_action = base_action.view(-1, self.chunk_size, self.act_dim)
-                pred_scale = pred_scale.view(-1, self.chunk_size, 1)
-                final_action[:, :, 0:3] *= th.pow(MAX_ACTION_SCALE, pred_scale) # only scale position
-                final_action = final_action.view(-1, self.chunk_size * self.act_dim)
-                final_action = final_action + pred_residual
-                final_action = th.clamp(final_action, -1.0, 1.0)
-            return {
-                "scaled_action": scaled_action,
-                "final_action": final_action,
-                "predict_second_return": pred_scale,
-            }
-
-        return scaled_action, final_action
