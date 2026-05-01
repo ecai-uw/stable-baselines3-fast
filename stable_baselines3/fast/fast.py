@@ -30,6 +30,54 @@ import warnings
 
 SelfFAST = TypeVar("SelfFAST", bound="FAST")
 
+
+def _add_gaussian(x, std):
+    """Additive iid Gaussian noise. Dispatches on np.ndarray vs torch.Tensor."""
+    if isinstance(x, th.Tensor):
+        return x + th.randn_like(x) * std
+    return x + (np.random.standard_normal(x.shape) * std).astype(x.dtype, copy=False)
+
+
+def _quat_tangent_noise(quat, sigma_rad):
+    """Small-rotation noise on a unit quaternion in xyzw convention.
+
+    Samples axis-angle delta ~ N(0, sigma_rad^2 * I_3), composes Δq ⊗ q via
+    Hamilton product, renormalizes. Operates over the trailing dim-4 axis;
+    leading dims (batch / n_envs) pass through. Dispatches np vs torch.
+    """
+    if isinstance(quat, th.Tensor):
+        delta = th.randn(quat.shape[:-1] + (3,), device=quat.device, dtype=quat.dtype) * sigma_rad
+        theta = th.linalg.norm(delta, dim=-1, keepdim=True)
+        half = 0.5 * theta
+        small = theta < 1e-8
+        safe_theta = th.where(small, th.ones_like(theta), theta)
+        ratio = th.where(small, th.full_like(theta, 0.5), th.sin(half) / safe_theta)
+        dq_w = th.cos(half)
+        cat = lambda xs: th.cat(xs, dim=-1)
+        norm = lambda x: th.linalg.norm(x, dim=-1, keepdim=True)
+    else:
+        delta = (np.random.standard_normal(quat.shape[:-1] + (3,)) * sigma_rad).astype(quat.dtype, copy=False)
+        theta = np.linalg.norm(delta, axis=-1, keepdims=True)
+        half = 0.5 * theta
+        small = theta < 1e-8
+        safe_theta = np.where(small, np.ones_like(theta), theta)
+        ratio = np.where(small, np.full_like(theta, 0.5), np.sin(half) / safe_theta)
+        dq_w = np.cos(half)
+        cat = lambda xs: np.concatenate(xs, axis=-1)
+        norm = lambda x: np.linalg.norm(x, axis=-1, keepdims=True)
+    dq_xyz = ratio * delta
+    qx, qy, qz, qw = quat[..., 0:1], quat[..., 1:2], quat[..., 2:3], quat[..., 3:4]
+    dx, dy, dz = dq_xyz[..., 0:1], dq_xyz[..., 1:2], dq_xyz[..., 2:3]
+    dw = dq_w
+    # Hamilton product Δq ⊗ q (xyzw):
+    ox = dw * qx + dx * qw + dy * qz - dz * qy
+    oy = dw * qy - dx * qz + dy * qw + dz * qx
+    oz = dw * qz + dx * qy - dy * qx + dz * qw
+    ow = dw * qw - dx * qx - dy * qy - dz * qz
+    out = cat([ox, oy, oz, ow])
+    return out / norm(out)
+
+
 class FAST(OffPolicyAlgorithm):
     """
     FAST
@@ -220,7 +268,16 @@ class FAST(OffPolicyAlgorithm):
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
         self.gains_mag = self.cfg.policy.gains_mag
-        
+
+        # Train-time proprio sensor noise on RL actor/critic inputs only.
+        # Base policy is read via sample_base_policy() and is not affected.
+        obs_noise_cfg = self.cfg.policy.get("obs_noise", {}) or {}
+        self.obs_noise_enabled = bool(obs_noise_cfg.get("enabled", False))
+        self.obs_noise_eef_pos_std = float(obs_noise_cfg.get("eef_pos_std", 0.0))
+        self.obs_noise_eef_quat_rad_std = float(obs_noise_cfg.get("eef_quat_rad_std", 0.0))
+        self.obs_noise_gripper_qpos_std = float(obs_noise_cfg.get("gripper_qpos_std", 0.0))
+
+
         # TODO: Handling jumpstart logic; a bit hacky right now, eventually need to clean up.
         # If curriculum, need to keep track of current model performance.
         # NOTE: this needs to be done in init and not setup model to properly load saved curriculum info.
@@ -354,10 +411,24 @@ class FAST(OffPolicyAlgorithm):
         self.critic = self.policy.critic # fast critic
         self.critic_target = self.policy.critic_target # fast critic target, using reward shaping
 
-    def _filter_rl_obs(self, obs):
+    def _filter_rl_obs(self, obs, add_noise: bool = True):
         # Buffer stores full env obs; actor/critic only know the RL subset.
         if isinstance(obs, dict):
-            return {k: obs[k] for k in self.rl_observation_space.spaces}
+            filtered = {k: obs[k] for k in self.rl_observation_space.spaces}
+            if self.obs_noise_enabled and add_noise:
+                if self.obs_noise_eef_pos_std > 0.0 and "robot0_eef_pos" in filtered:
+                    filtered["robot0_eef_pos"] = _add_gaussian(
+                        filtered["robot0_eef_pos"], self.obs_noise_eef_pos_std
+                    )
+                if self.obs_noise_gripper_qpos_std > 0.0 and "robot0_gripper_qpos" in filtered:
+                    filtered["robot0_gripper_qpos"] = _add_gaussian(
+                        filtered["robot0_gripper_qpos"], self.obs_noise_gripper_qpos_std
+                    )
+                if self.obs_noise_eef_quat_rad_std > 0.0 and "robot0_eef_quat" in filtered:
+                    filtered["robot0_eef_quat"] = _quat_tangent_noise(
+                        filtered["robot0_eef_quat"], self.obs_noise_eef_quat_rad_std
+                    )
+            return filtered
         return obs
 
     def train(self, gradient_steps: int, batch_size: int = 64) -> None:
@@ -818,13 +889,16 @@ class FAST(OffPolicyAlgorithm):
                 scaled_action = unscaled_action
         else:
             # Use predict() otherwise; this unsquashes, so re-scale if needed.
-            full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action}
+            # Eval rollouts (deterministic=True) read clean obs; training rollouts noised.
+            full_obs = {
+                "obs": self._filter_rl_obs(observation, add_noise=not deterministic),
+                "base_action": base_action,
+            }
             unscaled_action, _ = self.predict(full_obs, state, episode_start, deterministic)
             if isinstance(self.actor.action_space, spaces.Box):
                 scaled_action = self.actor.scale_action(unscaled_action)
             else:
                 scaled_action = unscaled_action
-            # return_dict['predict_second_return'] = predict_second_return
 
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
