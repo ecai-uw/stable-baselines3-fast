@@ -13,7 +13,7 @@ from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
 from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import get_parameters_by_name, polyak_update, should_collect_more_steps
+from stable_baselines3.common.utils import get_parameters_by_name, get_schedule_fn, polyak_update, should_collect_more_steps, update_learning_rate
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor, CombinedExtractor, FlattenExtractor, NatureCNN
 from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
 from stable_baselines3.fast.policies import BaseCriticValue, ResidualSACPolicy
@@ -173,6 +173,7 @@ class FAST(OffPolicyAlgorithm):
 		actor_gradient_steps: int = -1,
 		diffusion_policy=None,
         critic_backup_combine_type='min',
+        critic_lr: Optional[Union[float, Schedule]] = None,
         cfg: dict = {},
 	):
         super().__init__(
@@ -211,6 +212,8 @@ class FAST(OffPolicyAlgorithm):
         self.target_update_interval = target_update_interval
         self.ent_coef_optimizer: Optional[th.optim.Adam] = None
         self.actor_gradient_steps = actor_gradient_steps
+        # Separate critic LR (also applied to value-net optimizer). None = use learning_rate.
+        self._critic_lr_input = critic_lr
 
         # TODO: clean up; abstract as many params as possible into this cfg
         self.cfg = cfg
@@ -318,6 +321,11 @@ class FAST(OffPolicyAlgorithm):
         # Buffer stores the full env obs (all keys incl. base policy's images).
         # Policy (actor/critic) only sees the RL subset.
         self._setup_lr_schedule()
+        # Critic/value-net schedule: falls back to actor schedule when not specified.
+        if self._critic_lr_input is None:
+            self.critic_lr_schedule = self.lr_schedule
+        else:
+            self.critic_lr_schedule = get_schedule_fn(self._critic_lr_input)
         self.set_random_seed(self.seed)
 
         # Setting replay buffer.
@@ -410,6 +418,22 @@ class FAST(OffPolicyAlgorithm):
         self.actor = self.policy.actor # fast policy
         self.critic = self.policy.critic # fast critic
         self.critic_target = self.policy.critic_target # fast critic target, using reward shaping
+
+    def _update_learning_rate(self, optimizers) -> None:
+        # Override: critic optimizer follows self.critic_lr_schedule, everything
+        # else follows self.lr_schedule. When no separate critic_lr is configured,
+        # critic_lr_schedule IS lr_schedule, so behavior matches the SB3 default.
+        progress = self._current_progress_remaining
+        actor_lr = self.lr_schedule(progress)
+        critic_lr = self.critic_lr_schedule(progress)
+        self.logger.record("train/learning_rate", actor_lr)
+        if critic_lr != actor_lr:
+            self.logger.record("train/critic_learning_rate", critic_lr)
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        for optimizer in optimizers:
+            lr = critic_lr if optimizer is self.critic.optimizer else actor_lr
+            update_learning_rate(optimizer, lr)
 
     def _filter_rl_obs(self, obs, add_noise: bool = True):
         # Buffer stores full env obs; actor/critic only know the RL subset.
