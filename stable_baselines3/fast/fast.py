@@ -5,6 +5,7 @@ from typing import Any, ClassVar, Optional, Tuple, TypeVar, Union
 import numpy as np
 import torch as th
 from gymnasium import spaces
+from omegaconf import OmegaConf
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import ReplayBuffer
@@ -300,18 +301,33 @@ class FAST(OffPolicyAlgorithm):
         else:
             self.jumpstart_buffer = True
         
-        if self.jumpstart in ("curriculum", "random"):
-            base_stats_path = self.cfg.base_stats_path
+        # Load base-policy stats whenever a path is configured. Consumers of
+        # base_avg_horizon / base_avg_success_rate (jumpstart curriculum/random
+        # branches) gate their own use; base_p95_ee_force feeds the optional
+        # force-penalty fallback and is independent of jumpstart.
+        base_stats_path = self.cfg.get("base_stats_path", None)
+        if base_stats_path is not None:
             if "simple_reset" in self.cfg.env and self.cfg.env.simple_reset:
                 base, ext = os.path.splitext(base_stats_path)
                 base_stats_path = base + "_simple_reset" + ext
-            # Load base policy stats.
-            base_stats = np.loadtxt(base_stats_path, dtype=float)
-            self.base_avg_horizon = base_stats[0]
-            self.base_avg_success_rate = base_stats[1]
+            ext = os.path.splitext(base_stats_path)[1]
+            if ext == ".txt":
+                arr = np.loadtxt(base_stats_path, dtype=float)
+                base_stats = {
+                    "avg_horizon": float(arr[0]),
+                    "avg_success_rate": float(arr[1]),
+                }
+            elif ext in (".yaml", ".yml"):
+                base_stats = OmegaConf.to_container(OmegaConf.load(base_stats_path))
+            else:
+                raise ValueError(f"Unsupported base_stats extension: {ext}")
+            self.base_avg_horizon = base_stats["avg_horizon"]
+            self.base_avg_success_rate = base_stats["avg_success_rate"]
+            self.base_p95_ee_force = base_stats.get("force_p95", None)
         else:
             self.base_avg_horizon = None
             self.base_avg_success_rate = None
+            self.base_p95_ee_force = None
 
         # Extracting controller params.
         self.controller_configs = self.cfg.controller
