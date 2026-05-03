@@ -305,11 +305,13 @@ class FAST(OffPolicyAlgorithm):
         # base_avg_horizon / base_avg_success_rate (jumpstart curriculum/random
         # branches) gate their own use; base_p95_ee_force feeds the optional
         # force-penalty fallback and is independent of jumpstart.
-        base_stats_path = self.cfg.get("base_stats_path", None)
-        if base_stats_path is not None:
-            if "simple_reset" in self.cfg.env and self.cfg.env.simple_reset:
-                base, ext = os.path.splitext(base_stats_path)
-                base_stats_path = base + "_simple_reset" + ext
+        base_stats_path = self.cfg.base_stats_path
+        if not os.path.exists(base_stats_path):
+            warnings.warn(f"Base stats file not found at {base_stats_path}; base policy performance stats will be unavailable.")
+            self.base_avg_horizon = None
+            self.base_avg_success_rate = None
+            self.base_p95_ee_force = None
+        else:
             ext = os.path.splitext(base_stats_path)[1]
             if ext == ".txt":
                 arr = np.loadtxt(base_stats_path, dtype=float)
@@ -321,13 +323,9 @@ class FAST(OffPolicyAlgorithm):
                 base_stats = OmegaConf.to_container(OmegaConf.load(base_stats_path))
             else:
                 raise ValueError(f"Unsupported base_stats extension: {ext}")
-            self.base_avg_horizon = base_stats["avg_horizon"]
-            self.base_avg_success_rate = base_stats["avg_success_rate"]
+            self.base_avg_horizon = base_stats.get("avg_horizon", None)
+            self.base_avg_success_rate = base_stats.get("avg_success_rate", None)
             self.base_p95_ee_force = base_stats.get("force_p95", None)
-        else:
-            self.base_avg_horizon = None
-            self.base_avg_success_rate = None
-            self.base_p95_ee_force = None
 
         # Extracting controller params.
         self.controller_configs = self.cfg.controller
