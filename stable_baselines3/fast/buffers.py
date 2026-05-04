@@ -26,16 +26,6 @@ except ImportError:
     psutil = None
 
 
-class FastReplayBufferSamples(NamedTuple):
-    observations: th.Tensor
-    actions: th.Tensor
-    next_observations: th.Tensor
-    dones: th.Tensor
-    rewards: th.Tensor
-    base_actions: th.Tensor
-    next_base_actions: th.Tensor
-
-
 class FastDictReplayBufferSamples(NamedTuple):
     observations: TensorDict
     actions: th.Tensor
@@ -46,121 +36,10 @@ class FastDictReplayBufferSamples(NamedTuple):
     next_base_actions: th.Tensor
 
 
-class FastBuffer(ReplayBuffer):
+class DictFastBuffer(ReplayBuffer):
     """
-    Modified replay buffer with per-environment buffers for optional jumpstart learning.
-    """
-    def __init__(
-        self,
-        buffer_size: int,
-        observation_space: spaces.Space,
-        action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
-        n_envs: int = 1,
-        optimize_memory_usage: bool = False,
-        handle_timeout_termination: bool = True,
-        base_action_dim: Optional[int] = None,
-        # offline_mix_ratio: int = -1,
-    ):
-        super().__init__(buffer_size, observation_space, action_space, device, n_envs, optimize_memory_usage, handle_timeout_termination)
-        # Re-define self.pos and full to separately track positions for each environment.
-        self.pos = np.zeros(self.n_envs, dtype=np.int32)
-        self.full = np.zeros(self.n_envs, dtype=bool)
-
-        # For now, raise error for non-Box observation and action spaces
-        if not isinstance(self.observation_space, spaces.Box):
-            raise NotImplementedError("FastBuffer only supports Box observation spaces")
-        if not isinstance(self.action_space, spaces.Box):
-            raise NotImplementedError("FastBuffer only supports Box action spaces")
-
-        # For now, raise error if optimizing memory usage.
-        if optimize_memory_usage:
-            raise NotImplementedError("FastBuffer does not support memory optimization")
-
-        # For now, raise error if offline mix ratio is positive.
-        if self.offline_mix_ratio > 0:
-            raise NotImplementedError("FastBuffer does not support offline mixing")
-
-        # Cache of base-policy actions to skip pi0 calls inside the gradient loop.
-        # base_action_dim decouples this from action_dim: under single-step lookahead
-        # the residual emits one slot but observes lookahead_k slots of base intent.
-        # None => backcompat (matches action_dim, the legacy assumption).
-        self.base_action_dim = self.action_dim if base_action_dim is None else int(base_action_dim)
-        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.base_action_dim), dtype=np.float32)
-        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.base_action_dim), dtype=np.float32)
-    
-    def size(self) -> int:
-        # Total number of transitions stored across all environments.
-        size = np.sum(np.where(self.full, self.buffer_size, self.pos))
-        return int(size)
-
-    def reset(self) -> None:
-        self.pos = np.zeros(self.n_envs, dtype=np.int32)
-        self.full = np.zeros(self.n_envs, dtype=bool)
-    
-    def add(
-        self,
-        obs: np.ndarray,
-        next_obs: np.ndarray,
-        action: np.ndarray,
-        reward: np.ndarray,
-        done: np.ndarray,
-        infos: Optional[Union[dict, list]] = None,
-        mask: Optional[np.ndarray] = None,
-        base_action: Optional[np.ndarray] = None,
-        next_base_action: Optional[np.ndarray] = None,
-    ):
-        if mask is not None:
-            buffer_index = self.pos[mask]
-            env_index = np.arange(self.n_envs)[mask]
-        else:
-            mask = np.ones(self.n_envs, dtype=bool)
-            buffer_index = self.pos
-            env_index = mask
-
-        self.observations[buffer_index, env_index] = np.array(obs[mask])
-        self.next_observations[buffer_index, env_index] = np.array(next_obs[mask])
-        self.actions[buffer_index, env_index] = np.array(action[mask])
-        self.rewards[buffer_index, env_index] = np.array(reward[mask])
-        self.dones[buffer_index, env_index] = np.array(done[mask])
-        if self.handle_timeout_termination:
-            self.timeouts[buffer_index, env_index] = np.array([info.get("TimeLimit.truncated", False) for info, m in zip(infos, mask) if m])
-        self.base_actions[buffer_index, env_index] = np.array(base_action[mask])
-        self.next_base_actions[buffer_index, env_index] = np.array(next_base_action[mask])
-
-        self.pos[mask] += 1
-        # Updating full flags and wrapping positions for each env buffer.
-        for e in range(self.n_envs):
-            if self.pos[e] == self.buffer_size:
-                self.full[e] = True
-                self.pos[e] = 0
-
-    def sample(self, batch_size: int, env: Optional[VecNormalize] = None) -> FastReplayBufferSamples:
-        # Modified buffer sampling to uniformly weight all transitions across variably sized environment buffers.
-        env_upper_bound = np.where(self.full, self.buffer_size, self.pos)
-        env_prob = env_upper_bound / env_upper_bound.sum()
-        env_indices = np.random.choice(np.arange(self.n_envs).astype(int), size=batch_size, p=env_prob)
-        batch_inds = np.random.randint(low=0, high=env_upper_bound[env_indices], size=batch_size)
-
-        data = (
-            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
-            self.actions[batch_inds, env_indices, :],
-            self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env),
-            # Only use dones that are not due to timeouts
-            # deactivated by default (timeouts is initialized as an array of False)
-            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
-            self.base_actions[batch_inds, env_indices, :],
-            self.next_base_actions[batch_inds, env_indices, :],
-        )
-        return FastReplayBufferSamples(*tuple(map(self.to_torch, data)))
-    
-    def _get_samples(self, batch_inds: np.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
-        raise ValueError("Should not be called for FastBuffer")
-    
-class DictFastBuffer(FastBuffer):
-    """
-    Dict version of FastBuffer for image-based observations.
+    Replay buffer with per-environment buffers for optional jumpstart learning.
+    Stores dict observations to support image-based tasks.
     """
     def __init__(
         self,
@@ -173,29 +52,28 @@ class DictFastBuffer(FastBuffer):
         handle_timeout_termination: bool = True,
         base_action_dim: Optional[int] = None,
     ):
+        # Skip ReplayBuffer.__init__ (which allocates a monolithic obs array
+        # we don't want here) and run BaseBuffer.__init__ directly.
         super(ReplayBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
-        
+
         self.buffer_size = max(buffer_size // n_envs, 1)  # Buffer size per environment
 
-        assert not optimize_memory_usage, "FastBuffer does not support memory optimization"
+        assert not optimize_memory_usage, "DictFastBuffer does not support memory optimization"
         self.optimizer_memory_usage = optimize_memory_usage
-        
-        # Re-define self.pos and full to separately track positions for each environment.
+
+        # Per-env position trackers — overrides ReplayBuffer's scalar
+        # self.pos / self.full so each env has an independent ring index.
         self.pos = np.zeros(self.n_envs, dtype=np.int32)
         self.full = np.zeros(self.n_envs, dtype=bool)
 
         if not isinstance(self.observation_space, spaces.Dict):
-            raise NotImplementedError("FastBuffer only supports Dict observation spaces")
+            raise NotImplementedError("DictFastBuffer only supports Dict observation spaces")
         if not isinstance(self.action_space, spaces.Box):
-            raise NotImplementedError("FastBuffer only supports Box action spaces")
-        
-        # For now, raise error if optimizing memory usage.
-        if optimize_memory_usage:
-            raise NotImplementedError("FastBuffer does not support memory optimization")
-        
+            raise NotImplementedError("DictFastBuffer only supports Box action spaces")
+
         # For now, raise error if offline mix ratio is positive.
         if self.offline_mix_ratio > 0:
-            raise NotImplementedError("FastBuffer does not support offline mixing")
+            raise NotImplementedError("DictFastBuffer does not support offline mixing")
         
         # Check that the replay buffer can fit into the memory
         if psutil is not None:
@@ -249,7 +127,15 @@ class DictFastBuffer(FastBuffer):
                     "This system does not have apparently enough memory to store the complete "
                     f"replay buffer {total_memory_usage:.2f}GB > {mem_available:.2f}GB"
                 )
-        
+
+    def size(self) -> int:
+        # Total transitions stored, summed over per-env ring buffers.
+        return int(np.sum(np.where(self.full, self.buffer_size, self.pos)))
+
+    def reset(self) -> None:
+        self.pos = np.zeros(self.n_envs, dtype=np.int32)
+        self.full = np.zeros(self.n_envs, dtype=bool)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
