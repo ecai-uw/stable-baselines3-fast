@@ -59,6 +59,7 @@ class FastBuffer(ReplayBuffer):
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
+        base_action_dim: Optional[int] = None,
         # offline_mix_ratio: int = -1,
     ):
         super().__init__(buffer_size, observation_space, action_space, device, n_envs, optimize_memory_usage, handle_timeout_termination)
@@ -81,9 +82,12 @@ class FastBuffer(ReplayBuffer):
             raise NotImplementedError("FastBuffer does not support offline mixing")
 
         # Cache of base-policy actions to skip pi0 calls inside the gradient loop.
-        # Shape matches self.actions because residual = action_space - base_action, so same dims.
-        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
-        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        # base_action_dim decouples this from action_dim: under single-step lookahead
+        # the residual emits one slot but observes lookahead_k slots of base intent.
+        # None => backcompat (matches action_dim, the legacy assumption).
+        self.base_action_dim = self.action_dim if base_action_dim is None else int(base_action_dim)
+        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.base_action_dim), dtype=np.float32)
+        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.base_action_dim), dtype=np.float32)
     
     def size(self) -> int:
         # Total number of transitions stored across all environments.
@@ -167,6 +171,7 @@ class DictFastBuffer(FastBuffer):
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
+        base_action_dim: Optional[int] = None,
     ):
         super(ReplayBuffer, self).__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
         
@@ -212,9 +217,12 @@ class DictFastBuffer(FastBuffer):
         self.dones = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
 
         # Cache of base-policy actions to skip pi0 calls inside the gradient loop.
-        # Shape matches self.actions because residual = action_space - base_action, so same dims.
-        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
-        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=np.float32)
+        # base_action_dim decouples this from action_dim: under single-step lookahead
+        # the residual emits one slot but observes lookahead_k slots of base intent.
+        # None => backcompat (matches action_dim, the legacy assumption).
+        self.base_action_dim = self.action_dim if base_action_dim is None else int(base_action_dim)
+        self.base_actions = np.zeros((self.buffer_size, self.n_envs, self.base_action_dim), dtype=np.float32)
+        self.next_base_actions = np.zeros((self.buffer_size, self.n_envs, self.base_action_dim), dtype=np.float32)
 
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284

@@ -259,6 +259,7 @@ class ResidualSACPolicy(SACPolicy):
         chunk_size: int = 1,
         diffusion_act_dim: int = 1,
         rl_single_step: bool = False,
+        lookahead_k: Optional[int] = None,
     ):
         self.policy_type = policy_type
         self.chunk_size = chunk_size
@@ -279,6 +280,15 @@ class ResidualSACPolicy(SACPolicy):
             self.act_dim = self.diffusion_act_dim + 2
         else:
             raise ValueError("impedance_mode must be in ['fixed', 'variable'].")
+
+        # base_action context width (per decision) = lookahead_k * act_dim. Decoupled
+        # from the policy's own action width because in single-step lookahead mode
+        # the residual sees k upcoming base actions but emits only one residual slot.
+        # Backcompat: lookahead_k=None => effective_rl_chunk (chunked: chunk_size, single-step: 1).
+        if lookahead_k is None:
+            lookahead_k = self.effective_rl_chunk
+        self.lookahead_k = int(lookahead_k)
+        self.base_action_dim = self.lookahead_k * self.act_dim
 
         super().__init__(
             observation_space,
@@ -328,7 +338,9 @@ class ResidualSACPolicy(SACPolicy):
         dimensions - leaves other parts (Critic, etc.) unchanged.
         """
         actor_kwargs = self._update_features_extractor(self.actor_kwargs, features_extractor)
-        actor_kwargs["features_dim"] += self.action_space.shape[0]
+        # base_action is concatenated with features inside ResidualActor; size accordingly.
+        # Under single-step lookahead, base_action_dim != action_space.shape[0].
+        actor_kwargs["features_dim"] += self.base_action_dim
         return ResidualActor(**actor_kwargs).to(self.device)
 
     def predict(

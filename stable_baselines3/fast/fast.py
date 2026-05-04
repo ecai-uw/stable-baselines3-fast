@@ -259,6 +259,52 @@ class FAST(OffPolicyAlgorithm):
         # When False, RL emits a chunk_size-length residual, matching legacy behavior.
         self.rl_single_step = bool(self.cfg.rl_single_step) if "rl_single_step" in self.cfg else False
 
+        # How many upcoming base-policy actions the residual sees per decision.
+        # Lives under cfg.policy because it shapes the residual's input — the base
+        # policy itself is indifferent. null/missing => backcompat default: chunked
+        # => chunk_size, single-step => 1 (the latter preserves the legacy
+        # single-step behavior where the residual only saw one base action). Set
+        # explicitly (typically == chunk_size or larger, up to prediction_horizon)
+        # to give the single-step residual the same lookahead context the chunked
+        # path already enjoys.
+        cfg_lookahead_k = self.cfg.policy.get("lookahead_k", None)
+        if cfg_lookahead_k is None:
+            self.lookahead_k = 1 if self.rl_single_step else self.chunk_size
+        else:
+            self.lookahead_k = int(cfg_lookahead_k)
+
+        # Full base-policy prediction horizon. Read from cfg (not the wrapper) so it's
+        # available during _setup_model — diffusion_policy is attached later in
+        # train_fast.py, and FAST.load runs _setup_model before that attachment too.
+        # Sized so the single-step lookahead cache can hold prediction_horizon slots
+        # and vend any k-action window starting in [0, chunk_size-1] without an extra
+        # base call. Defaults to chunk_size (legacy: no slack) when absent.
+        self.prediction_horizon = int(self.cfg.base_policy.get("prediction_horizon", self.chunk_size))
+
+        # Validate: only single-step uses peek_lookahead_actions / the deep cache.
+        # The chunked path always feeds the residual the full chunk_size chunk and
+        # ignores lookahead_k. In single-step a peek at step_idx ∈ [0, chunk_size-1]
+        # must read lookahead_k slots without exceeding the cache, so the cache
+        # must be at least chunk_size + lookahead_k - 1 deep.
+        if self.rl_single_step and self.lookahead_k > 1:
+            required_horizon = self.chunk_size + self.lookahead_k - 1
+            if self.prediction_horizon < required_horizon:
+                raise ValueError(
+                    f"lookahead_k={self.lookahead_k} with chunk_size={self.chunk_size} requires "
+                    f"prediction_horizon >= {required_horizon}, but base policy reports "
+                    f"prediction_horizon={self.prediction_horizon}. Either lower lookahead_k or "
+                    f"retrain the base policy with a longer chunk."
+                )
+        # In chunked mode the residual already sees the full chunk; lookahead_k is a
+        # no-op and any other value silently mis-sizes the buffer / actor input.
+        # Reject early so the misunderstanding surfaces at config time.
+        if not self.rl_single_step and self.lookahead_k != self.chunk_size:
+            raise ValueError(
+                f"lookahead_k={self.lookahead_k} is only meaningful under rl_single_step=True. "
+                f"In chunked mode the residual already observes the full chunk, so lookahead_k "
+                f"must equal chunk_size ({self.chunk_size}) or be left null."
+            )
+
         # Per-rollout base-policy chunk cache (single-step path only).
         # idx == chunk_size is the "needs refill" sentinel for the first call.
         self._base_chunk_cache: Optional[np.ndarray] = None
@@ -343,6 +389,12 @@ class FAST(OffPolicyAlgorithm):
         self.set_random_seed(self.seed)
 
         # Setting replay buffer.
+        # base_action_dim = lookahead_k * per-slot dim. Per-slot dim equals action_space.shape[0]
+        # divided by the residual's effective chunk (1 for single-step, chunk_size otherwise),
+        # so this is impedance-aware without re-reading the controller cfg here.
+        effective_rl_chunk = 1 if self.rl_single_step else self.chunk_size
+        slot_dim = self.action_space.shape[0] // effective_rl_chunk
+        base_action_dim = self.lookahead_k * slot_dim
         self.replay_buffer_class = DictFastBuffer
         self.replay_buffer = self.replay_buffer_class(
             self.buffer_size,
@@ -351,6 +403,7 @@ class FAST(OffPolicyAlgorithm):
             device=self.device,
             n_envs=self.n_envs,
             optimize_memory_usage=self.optimize_memory_usage,
+            base_action_dim=base_action_dim,
         )
 
         # Build RL-only observation space from policy.observation_meta.
@@ -380,6 +433,7 @@ class FAST(OffPolicyAlgorithm):
             chunk_size=self.chunk_size,
             diffusion_act_dim=self.action_dim,
             rl_single_step=self.rl_single_step,
+            lookahead_k=self.lookahead_k,
         )
         
         self.policy = self.policy_class(
@@ -672,7 +726,31 @@ class FAST(OffPolicyAlgorithm):
         else:
             saved_pytorch_variables = ["ent_coef_tensor"]
         return state_dicts, saved_pytorch_variables
-    
+
+    def load_replay_buffer(self, path, truncate_last_traj: bool = True) -> None:
+        """Load buffer and hard-error if its base_action width disagrees with current cfg.
+
+        Without this guard, a lookahead_k mismatch between the saved buffer and current
+        cfg surfaces as an opaque numpy broadcast error inside replay_buffer.add() partway
+        into the first rollout. The buffer can't be resized in-place (would silently
+        truncate or zero-pad cached base intent), so we tell the user to start fresh.
+        """
+        super().load_replay_buffer(path, truncate_last_traj=truncate_last_traj)
+        loaded_dim = int(self.replay_buffer.base_actions.shape[-1])
+        effective_rl_chunk = 1 if self.rl_single_step else self.chunk_size
+        slot_dim = self.action_space.shape[0] // effective_rl_chunk
+        cfg_dim = self.lookahead_k * slot_dim
+        if loaded_dim != cfg_dim:
+            raise ValueError(
+                f"Replay buffer base_action width ({loaded_dim}) does not match the current cfg "
+                f"({cfg_dim} = lookahead_k={self.lookahead_k} * slot_dim={slot_dim}). The buffer "
+                f"was trained under a different lookahead_k and cannot be resumed in-place. Start "
+                f"a fresh run instead, or revert lookahead_k to match the saved checkpoint."
+            )
+        # Sync attribute on buffers pickled before base_action_dim existed.
+        if not hasattr(self.replay_buffer, "base_action_dim"):
+            self.replay_buffer.base_action_dim = loaded_dim
+
     def _store_transition(
         self,
         replay_buffer: ReplayBuffer,
@@ -712,8 +790,10 @@ class FAST(OffPolicyAlgorithm):
         if self.rl_single_step:
             # Force a refill on any done so the next-state base action is conditioned
             # on the post-reset obs. Mid-chunk this also re-anchors all envs' chunks.
-            next_base_action = self.peek_next_base_action(
-                next_obs, force_refill=bool(np.any(dones))
+            # Returns a (B, lookahead_k * act_dim_eff) window matching the obs shape
+            # the residual will see at replay time.
+            next_base_action = self.peek_lookahead_actions(
+                next_obs, self.lookahead_k, force_refill=bool(np.any(dones))
             )
         else:
             next_base_action = self.sample_base_policy(next_obs, return_numpy=True)
@@ -802,10 +882,13 @@ class FAST(OffPolicyAlgorithm):
         )
         final_action = action_dict['final_action']
         base_action = action_dict['base_action']
+        # Single-slot executable base action (== base_action under the chunked path,
+        # but a single slot vs the lookahead-window base_action under single-step).
+        base_action_exec = action_dict['base_action_exec']
 
         # Checking jump-start logic.
         if self.jumpstart in ("random", "curriculum"):
-            final_action = np.where(use_base[:, None], base_action, final_action)
+            final_action = np.where(use_base[:, None], base_action_exec, final_action)
 
         buffer_action = final_action # Buffer action is the final combined action.
         return final_action, buffer_action, use_base, base_action
@@ -860,19 +943,26 @@ class FAST(OffPolicyAlgorithm):
         """
         return_dict = {}
         # First, sample action from base policy (unless a cached one was provided).
+        # In single-step lookahead mode the cached `base_action` is a flattened
+        # window of `lookahead_k` slots; the executed slot is the first one.
         if base_action is None:
             base_action = self.sample_base_policy(observation, return_numpy=False)
+        if self.rl_single_step and self.lookahead_k > 1:
+            exec_dim = base_action.shape[-1] // self.lookahead_k
+            base_action_exec = base_action[..., :exec_dim]
+        else:
+            base_action_exec = base_action
 
         # Sample action from fast policy.
         full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action}
         scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
-        
+
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
             # Setting residual scale based on residual scale schedule.
             residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
             final_action_dict = self.policy.get_final_action(
-                scaled_action, base_action, residual_mag, use_numpy=False
+                scaled_action, base_action_exec, residual_mag, use_numpy=False
             )
             scaled_action = final_action_dict["scaled_action"]
             final_action = final_action_dict["final_action"]
@@ -896,18 +986,24 @@ class FAST(OffPolicyAlgorithm):
             residual_mag: float = 1.0,
     ) -> dict[str, np.ndarray]:
         return_dict = {}
-        # First, sample action from base policy.
-        # Single-step path: pop one action from the cached chunk (refilled as needed).
-        # Chunked path: return the full chunk flattened to (B, chunk_size * act_dim_eff).
+        # Sample action from base policy. Single-step path peeks a lookahead
+        # window of `lookahead_k` slots to feed the residual obs (peek doesn't
+        # advance the cache pointer), then advances by exactly one slot for the
+        # action that gets executed this step. Chunked path returns the full
+        # chunk flat. `base_action` is the obs/buffer view; `base_action_exec`
+        # is the single slot fed to get_final_action below.
         if self.rl_single_step:
-            base_action = self.get_next_base_action(observation)
+            base_action = self.peek_lookahead_actions(observation, self.lookahead_k)
+            base_action_exec = self.get_next_base_action(observation)
         else:
             base_action = self.sample_base_policy(observation, return_numpy=True)
+            base_action_exec = base_action
         return_dict['base_action'] = base_action
+        return_dict['base_action_exec'] = base_action_exec
 
         # If sample_base is True, return only the base action as the final action.
         if sample_base:
-            return_dict['final_action'] = base_action
+            return_dict['final_action'] = base_action_exec
             return return_dict
 
         # Sample action from fast policy.
@@ -938,10 +1034,12 @@ class FAST(OffPolicyAlgorithm):
             else:
                 scaled_action = unscaled_action
 
-        # Combine base action and fast policy action.
+        # Combine base action and fast policy action. In single-step lookahead
+        # mode, scaled_action is one slot wide; combine with the executed slot
+        # only (not the lookahead window).
         if isinstance(self.policy, ResidualSACPolicy):
             final_action_dict = self.policy.get_final_action(
-                scaled_action, base_action, residual_mag, use_numpy=True
+                scaled_action, base_action_exec, residual_mag, use_numpy=True
             )
             scaled_action = final_action_dict["scaled_action"]
             final_action = final_action_dict["final_action"]
@@ -960,10 +1058,17 @@ class FAST(OffPolicyAlgorithm):
         self,
         observation: Union[np.ndarray, th.Tensor, dict[str, Union[np.ndarray, th.Tensor]]],
         return_numpy: bool,
+        full: bool = False,
     ) -> Union[np.ndarray, th.Tensor]:
         """
         Sample action from base policy. Passes per-key obs dict to the base
         policy wrapper, which selects its own subset via base_obs_meta.
+
+        Args:
+            full: If False (default), returns the chunked (B, chunk_size * act_dim_eff)
+                output — the chunked-residual obs path. If True, returns the full
+                (B, prediction_horizon * act_dim_eff) prediction without truncation —
+                used by the single-step lookahead cache.
         """
         if isinstance(observation, dict):
             # Convert each key to numpy for base policy wrapper.
@@ -979,10 +1084,15 @@ class FAST(OffPolicyAlgorithm):
             else:
                 base_observation = observation.cpu().numpy().astype(np.float32)
 
-        base_action = self.diffusion_policy(base_observation, return_numpy=return_numpy)
-        base_action = base_action.reshape(-1, self.chunk_size * self.action_dim)
+        if full:
+            base_action = self.diffusion_policy.predict_full_chunk(base_observation, return_numpy=return_numpy)
+            horizon = self.prediction_horizon
+        else:
+            base_action = self.diffusion_policy(base_observation, return_numpy=return_numpy)
+            horizon = self.chunk_size
+        base_action = base_action.reshape(-1, horizon * self.action_dim)
         if self.policy_impedance_mode != "fixed":
-            base_action = self.augment_controller_action(base_action, is_numpy=return_numpy)
+            base_action = self.augment_controller_action(base_action, is_numpy=return_numpy, horizon=horizon)
 
         if return_numpy:
             if not isinstance(base_action, np.ndarray):
@@ -1007,15 +1117,20 @@ class FAST(OffPolicyAlgorithm):
     def _refill_base_chunk_cache(self, observation):
         """Query the base policy on `observation` and overwrite the cache for all envs.
 
-        Resets the global step idx to 0. Used by both `get_next_base_action` and
-        `peek_next_base_action` — refill events are shared across all envs (lockstep
-        replan), so cache semantics match whether the trigger is a chunk boundary or
-        a mid-chunk episode reset in any env.
+        The cache holds the FULL prediction_horizon, not just chunk_size. Execution
+        still consumes only the first chunk_size slots (after which a fresh refill
+        triggers); the extra slots `[chunk_size : prediction_horizon)` provide
+        lookahead context for the residual policy via `peek_lookahead_actions`.
+
+        Resets the step idx to 0. Used by both `get_next_base_action` and
+        `peek_next_base_action` / `peek_lookahead_actions` — refill events are shared
+        across all envs (lockstep replan), so cache semantics match whether the
+        trigger is a chunk boundary or a mid-chunk episode reset in any env.
         """
-        chunk = self.sample_base_policy(observation, return_numpy=True)
-        # (n_envs, chunk_size * act_dim_eff) -> (n_envs, chunk_size, act_dim_eff)
-        act_dim_eff = chunk.shape[-1] // self.chunk_size
-        self._base_chunk_cache = chunk.reshape(-1, self.chunk_size, act_dim_eff)
+        chunk = self.sample_base_policy(observation, return_numpy=True, full=True)
+        # (n_envs, prediction_horizon * act_dim_eff) -> (n_envs, prediction_horizon, act_dim_eff)
+        act_dim_eff = chunk.shape[-1] // self.prediction_horizon
+        self._base_chunk_cache = chunk.reshape(-1, self.prediction_horizon, act_dim_eff)
         self._chunk_step_idx = 0
 
     def get_next_base_action(self, observation):
@@ -1023,7 +1138,8 @@ class FAST(OffPolicyAlgorithm):
 
         Refills the cache from `observation` when the previous iteration exhausted
         the chunk or flagged a forced refill (e.g. via `peek_next_base_action` on a
-        done transition).
+        done transition). Refill cadence is keyed off chunk_size (execution horizon),
+        not prediction_horizon (cache depth).
         """
         if self._chunk_step_idx >= self.chunk_size:
             self._refill_base_chunk_cache(observation)
@@ -1042,6 +1158,22 @@ class FAST(OffPolicyAlgorithm):
         if force_refill or self._chunk_step_idx >= self.chunk_size:
             self._refill_base_chunk_cache(observation)
         return self._base_chunk_cache[:, self._chunk_step_idx, :].copy()
+
+    def peek_lookahead_actions(self, observation, k: int, force_refill: bool = False):
+        """Single-step path: return the next `k` cached base actions, flattened.
+
+        Returns shape (n_envs, k * act_dim_eff). Used to feed the residual policy
+        a window of upcoming base intent (instead of just one slot). Shares the
+        same refill semantics as `peek_next_base_action`. Validation in _setup_model
+        guarantees `chunk_size + k - 1 <= prediction_horizon`, so the slice is
+        always in-bounds without forcing extra base-policy inference.
+        """
+        if force_refill or self._chunk_step_idx >= self.chunk_size:
+            self._refill_base_chunk_cache(observation)
+        end = self._chunk_step_idx + k
+        window = self._base_chunk_cache[:, self._chunk_step_idx:end, :].copy()
+        n_envs = window.shape[0]
+        return window.reshape(n_envs, -1)
 
     def get_rewards(self, replay_data):
         """
@@ -1070,30 +1202,37 @@ class FAST(OffPolicyAlgorithm):
         gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean() * smooth_gain_lambda
         return gain_smoothness_penalty
 
-    def augment_controller_action(self, action, is_numpy: bool = True):
+    def augment_controller_action(self, action, is_numpy: bool = True, horizon: Optional[int] = None):
         """
-        Helper function to augment action with impedance parameters based on controller config. This does nothing if 
-        impedance mode is fixed, so it can always be called. The input action should be an action-chunked, OSC 
-        action (i.e. chunk_size * act_dim).
+        Helper function to augment action with impedance parameters based on controller config. This does nothing if
+        impedance mode is fixed, so it can always be called. The input action should be a flattened time-major
+        chunk of length `horizon * self.action_dim`.
+
+        Args:
+            horizon: Number of timesteps in the chunk. Defaults to self.chunk_size for backwards compat.
+                Pass self.prediction_horizon when augmenting a full base-policy chunk for the lookahead cache.
 
         Note: the default control params are assumed to be 0 in the normalized/scaled action space.
         """
         if self.policy_impedance_mode == "fixed":
             return action
 
+        if horizon is None:
+            horizon = self.chunk_size
+
         # Variable impedance: prepend damping + stiffness scalar channels (both zero in the
         # normalized action space, so the base policy contributes neutral gains).
         n_actions = action.shape[0]
-        action = action.reshape(n_actions, self.chunk_size, self.action_dim)
+        action = action.reshape(n_actions, horizon, self.action_dim)
         if is_numpy:
-            damping_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
-            stiffness_action = np.zeros((n_actions, self.chunk_size, 1), dtype=np.float32)
+            damping_action = np.zeros((n_actions, horizon, 1), dtype=np.float32)
+            stiffness_action = np.zeros((n_actions, horizon, 1), dtype=np.float32)
             action = np.concatenate([damping_action, stiffness_action, action], axis=-1)
         else:
-            damping_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
-            stiffness_action = th.zeros((n_actions, self.chunk_size, 1), device=action.device, dtype=th.float32)
+            damping_action = th.zeros((n_actions, horizon, 1), device=action.device, dtype=th.float32)
+            stiffness_action = th.zeros((n_actions, horizon, 1), device=action.device, dtype=th.float32)
             action = th.cat([damping_action, stiffness_action, action], dim=-1)
-        action = action.reshape(n_actions, self.chunk_size * (self.action_dim + 2))
+        action = action.reshape(n_actions, horizon * (self.action_dim + 2))
 
         return action
 
