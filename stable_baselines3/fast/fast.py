@@ -1,11 +1,9 @@
-import os
 from copy import deepcopy
 from typing import Any, ClassVar, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import torch as th
 from gymnasium import spaces
-from omegaconf import OmegaConf
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import ReplayBuffer
@@ -24,59 +22,19 @@ from stable_baselines3.common.utils import safe_mean, should_collect_more_steps
 from stable_baselines3.common.vec_env import VecEnv
 
 from stable_baselines3.fast.buffers import DictFastBuffer
+from stable_baselines3.fast.utils import (
+    BaseChunkCache,
+    add_gaussian,
+    augment_controller_action,
+    load_base_stats,
+    quat_tangent_noise,
+)
 
 from tqdm import tqdm
 from functools import partial
 import warnings
 
 SelfFAST = TypeVar("SelfFAST", bound="FAST")
-
-
-def _add_gaussian(x, std):
-    """Additive iid Gaussian noise. Dispatches on np.ndarray vs torch.Tensor."""
-    if isinstance(x, th.Tensor):
-        return x + th.randn_like(x) * std
-    return x + (np.random.standard_normal(x.shape) * std).astype(x.dtype, copy=False)
-
-
-def _quat_tangent_noise(quat, sigma_rad):
-    """Small-rotation noise on a unit quaternion in xyzw convention.
-
-    Samples axis-angle delta ~ N(0, sigma_rad^2 * I_3), composes Δq ⊗ q via
-    Hamilton product, renormalizes. Operates over the trailing dim-4 axis;
-    leading dims (batch / n_envs) pass through. Dispatches np vs torch.
-    """
-    if isinstance(quat, th.Tensor):
-        delta = th.randn(quat.shape[:-1] + (3,), device=quat.device, dtype=quat.dtype) * sigma_rad
-        theta = th.linalg.norm(delta, dim=-1, keepdim=True)
-        half = 0.5 * theta
-        small = theta < 1e-8
-        safe_theta = th.where(small, th.ones_like(theta), theta)
-        ratio = th.where(small, th.full_like(theta, 0.5), th.sin(half) / safe_theta)
-        dq_w = th.cos(half)
-        cat = lambda xs: th.cat(xs, dim=-1)
-        norm = lambda x: th.linalg.norm(x, dim=-1, keepdim=True)
-    else:
-        delta = (np.random.standard_normal(quat.shape[:-1] + (3,)) * sigma_rad).astype(quat.dtype, copy=False)
-        theta = np.linalg.norm(delta, axis=-1, keepdims=True)
-        half = 0.5 * theta
-        small = theta < 1e-8
-        safe_theta = np.where(small, np.ones_like(theta), theta)
-        ratio = np.where(small, np.full_like(theta, 0.5), np.sin(half) / safe_theta)
-        dq_w = np.cos(half)
-        cat = lambda xs: np.concatenate(xs, axis=-1)
-        norm = lambda x: np.linalg.norm(x, axis=-1, keepdims=True)
-    dq_xyz = ratio * delta
-    qx, qy, qz, qw = quat[..., 0:1], quat[..., 1:2], quat[..., 2:3], quat[..., 3:4]
-    dx, dy, dz = dq_xyz[..., 0:1], dq_xyz[..., 1:2], dq_xyz[..., 2:3]
-    dw = dq_w
-    # Hamilton product Δq ⊗ q (xyzw):
-    ox = dw * qx + dx * qw + dy * qz - dz * qy
-    oy = dw * qy - dx * qz + dy * qw + dz * qx
-    oz = dw * qz + dx * qy - dy * qx + dz * qw
-    ow = dw * qw - dx * qx - dy * qy - dz * qz
-    out = cat([ox, oy, oz, ow])
-    return out / norm(out)
 
 
 class FAST(OffPolicyAlgorithm):
@@ -311,10 +269,13 @@ class FAST(OffPolicyAlgorithm):
                 f"must equal chunk_size ({self.chunk_size}) or be left null."
             )
 
-        # Per-rollout base-policy chunk cache (single-step path only).
-        # idx == chunk_size is the "needs refill" sentinel for the first call.
-        self._base_chunk_cache: Optional[np.ndarray] = None
-        self._chunk_step_idx = self.chunk_size
+        # Per-rollout base-policy chunk cache (single-step path only). Constructed
+        # unconditionally; the chunked path simply never touches it.
+        self._base_cache = BaseChunkCache(
+            chunk_size=self.chunk_size,
+            prediction_horizon=self.prediction_horizon,
+            sample_full=lambda obs: self.sample_base_policy(obs, return_numpy=True, full=True),
+        )
 
         # Extracting RL policy config params.
         self.policy_type = self.cfg.policy.type
@@ -357,24 +318,13 @@ class FAST(OffPolicyAlgorithm):
         # base_avg_horizon / base_avg_success_rate (jumpstart curriculum/random
         # branches) gate their own use; base_p95_ee_force feeds the optional
         # force-penalty fallback and is independent of jumpstart.
-        base_stats_path = self.cfg.base_stats_path
-        if not os.path.exists(base_stats_path):
-            warnings.warn(f"Base stats file not found at {base_stats_path}; base policy performance stats will be unavailable.")
+        base_stats = load_base_stats(self.cfg.base_stats_path)
+        if base_stats is None:
+            warnings.warn(f"Base stats file not found at {self.cfg.base_stats_path}; base policy performance stats will be unavailable.")
             self.base_avg_horizon = None
             self.base_avg_success_rate = None
             self.base_p95_ee_force = None
         else:
-            ext = os.path.splitext(base_stats_path)[1]
-            if ext == ".txt":
-                arr = np.loadtxt(base_stats_path, dtype=float)
-                base_stats = {
-                    "avg_horizon": float(arr[0]),
-                    "avg_success_rate": float(arr[1]),
-                }
-            elif ext in (".yaml", ".yml"):
-                base_stats = OmegaConf.to_container(OmegaConf.load(base_stats_path))
-            else:
-                raise ValueError(f"Unsupported base_stats extension: {ext}")
             self.base_avg_horizon = base_stats.get("avg_horizon", None)
             self.base_avg_success_rate = base_stats.get("avg_success_rate", None)
             self.base_p95_ee_force = base_stats.get("force_p95", None)
@@ -527,15 +477,15 @@ class FAST(OffPolicyAlgorithm):
             filtered = {k: obs[k] for k in self.rl_observation_space.spaces}
             if self.obs_noise_enabled and add_noise:
                 if self.obs_noise_eef_pos_std > 0.0 and "robot0_eef_pos" in filtered:
-                    filtered["robot0_eef_pos"] = _add_gaussian(
+                    filtered["robot0_eef_pos"] = add_gaussian(
                         filtered["robot0_eef_pos"], self.obs_noise_eef_pos_std
                     )
                 if self.obs_noise_gripper_qpos_std > 0.0 and "robot0_gripper_qpos" in filtered:
-                    filtered["robot0_gripper_qpos"] = _add_gaussian(
+                    filtered["robot0_gripper_qpos"] = add_gaussian(
                         filtered["robot0_gripper_qpos"], self.obs_noise_gripper_qpos_std
                     )
                 if self.obs_noise_eef_quat_rad_std > 0.0 and "robot0_eef_quat" in filtered:
-                    filtered["robot0_eef_quat"] = _quat_tangent_noise(
+                    filtered["robot0_eef_quat"] = quat_tangent_noise(
                         filtered["robot0_eef_quat"], self.obs_noise_eef_quat_rad_std
                     )
             return filtered
@@ -742,6 +692,9 @@ class FAST(OffPolicyAlgorithm):
         return super()._excluded_save_params() + [
             "actor", "critic", "critic_target", "diffusion_policy",
             "_random_thresholds", "_prev_dones",
+            # Rollout-ephemeral; reset at the start of every rollout/eval. Excluded
+            # because its sample_full closure captures self (env handles aren't picklable).
+            "_base_cache",
         ] # noqa: RUF005
 
     def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
@@ -1129,7 +1082,13 @@ class FAST(OffPolicyAlgorithm):
             horizon = self.chunk_size
         base_action = base_action.reshape(-1, horizon * self.action_dim)
         if self.policy_impedance_mode != "fixed":
-            base_action = self.augment_controller_action(base_action, is_numpy=return_numpy, horizon=horizon)
+            base_action = augment_controller_action(
+                base_action,
+                impedance_mode=self.policy_impedance_mode,
+                action_dim=self.action_dim,
+                horizon=horizon,
+                is_numpy=return_numpy,
+            )
 
         if return_numpy:
             if not isinstance(base_action, np.ndarray):
@@ -1140,77 +1099,16 @@ class FAST(OffPolicyAlgorithm):
                 base_action = th.from_numpy(base_action)
             return base_action.to(device=self.device, dtype=th.float32)
         
+    # Thin delegates over self._base_cache (BaseChunkCache). Kept on FAST so external
+    # callers (eval_fast, logging_utils, base_policy_utils, visualize_q_*) don't churn.
     def reset_base_cache(self):
-        """Invalidate the single-step base-policy chunk cache.
-
-        Call between contexts that independently drive the base policy (e.g.
-        between training rollouts and eval episodes, where batch shapes and obs
-        distributions differ). After reset, the next `get_next_base_action` /
-        `peek_next_base_action` call will refill.
-        """
-        self._base_chunk_cache = None
-        self._chunk_step_idx = self.chunk_size
-
-    def _refill_base_chunk_cache(self, observation):
-        """Query the base policy on `observation` and overwrite the cache for all envs.
-
-        The cache holds the FULL prediction_horizon, not just chunk_size. Execution
-        still consumes only the first chunk_size slots (after which a fresh refill
-        triggers); the extra slots `[chunk_size : prediction_horizon)` provide
-        lookahead context for the residual policy via `peek_lookahead_actions`.
-
-        Resets the step idx to 0. Used by both `get_next_base_action` and
-        `peek_next_base_action` / `peek_lookahead_actions` — refill events are shared
-        across all envs (lockstep replan), so cache semantics match whether the
-        trigger is a chunk boundary or a mid-chunk episode reset in any env.
-        """
-        chunk = self.sample_base_policy(observation, return_numpy=True, full=True)
-        # (n_envs, prediction_horizon * act_dim_eff) -> (n_envs, prediction_horizon, act_dim_eff)
-        act_dim_eff = chunk.shape[-1] // self.prediction_horizon
-        self._base_chunk_cache = chunk.reshape(-1, self.prediction_horizon, act_dim_eff)
-        self._chunk_step_idx = 0
+        self._base_cache.reset()
 
     def get_next_base_action(self, observation):
-        """Single-step path: return the current chunk slot and advance idx.
-
-        Refills the cache from `observation` when the previous iteration exhausted
-        the chunk or flagged a forced refill (e.g. via `peek_next_base_action` on a
-        done transition). Refill cadence is keyed off chunk_size (execution horizon),
-        not prediction_horizon (cache depth).
-        """
-        if self._chunk_step_idx >= self.chunk_size:
-            self._refill_base_chunk_cache(observation)
-        action = self._base_chunk_cache[:, self._chunk_step_idx, :].copy()
-        self._chunk_step_idx += 1
-        return action
-
-    def peek_next_base_action(self, observation, force_refill: bool = False):
-        """Single-step path: return the *upcoming* chunk slot without advancing idx.
-
-        Used by `_store_transition` for `next_base_action`. If `force_refill` (any
-        env reset this step) or the chunk is exhausted, eagerly refills from
-        `observation` so the returned action is conditioned on the new episode's
-        obs and the next rollout iteration is a cache hit.
-        """
-        if force_refill or self._chunk_step_idx >= self.chunk_size:
-            self._refill_base_chunk_cache(observation)
-        return self._base_chunk_cache[:, self._chunk_step_idx, :].copy()
+        return self._base_cache.get_next(observation)
 
     def peek_lookahead_actions(self, observation, k: int, force_refill: bool = False):
-        """Single-step path: return the next `k` cached base actions, flattened.
-
-        Returns shape (n_envs, k * act_dim_eff). Used to feed the residual policy
-        a window of upcoming base intent (instead of just one slot). Shares the
-        same refill semantics as `peek_next_base_action`. Validation in _setup_model
-        guarantees `chunk_size + k - 1 <= prediction_horizon`, so the slice is
-        always in-bounds without forcing extra base-policy inference.
-        """
-        if force_refill or self._chunk_step_idx >= self.chunk_size:
-            self._refill_base_chunk_cache(observation)
-        end = self._chunk_step_idx + k
-        window = self._base_chunk_cache[:, self._chunk_step_idx:end, :].copy()
-        n_envs = window.shape[0]
-        return window.reshape(n_envs, -1)
+        return self._base_cache.peek_lookahead(observation, k, force_refill=force_refill)
 
     def get_rewards(self, replay_data):
         """
@@ -1238,40 +1136,6 @@ class FAST(OffPolicyAlgorithm):
         ], dim=1)
         gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean() * smooth_gain_lambda
         return gain_smoothness_penalty
-
-    def augment_controller_action(self, action, is_numpy: bool = True, horizon: Optional[int] = None):
-        """
-        Helper function to augment action with impedance parameters based on controller config. This does nothing if
-        impedance mode is fixed, so it can always be called. The input action should be a flattened time-major
-        chunk of length `horizon * self.action_dim`.
-
-        Args:
-            horizon: Number of timesteps in the chunk. Defaults to self.chunk_size for backwards compat.
-                Pass self.prediction_horizon when augmenting a full base-policy chunk for the lookahead cache.
-
-        Note: the default control params are assumed to be 0 in the normalized/scaled action space.
-        """
-        if self.policy_impedance_mode == "fixed":
-            return action
-
-        if horizon is None:
-            horizon = self.chunk_size
-
-        # Variable impedance: prepend damping + stiffness scalar channels (both zero in the
-        # normalized action space, so the base policy contributes neutral gains).
-        n_actions = action.shape[0]
-        action = action.reshape(n_actions, horizon, self.action_dim)
-        if is_numpy:
-            damping_action = np.zeros((n_actions, horizon, 1), dtype=np.float32)
-            stiffness_action = np.zeros((n_actions, horizon, 1), dtype=np.float32)
-            action = np.concatenate([damping_action, stiffness_action, action], axis=-1)
-        else:
-            damping_action = th.zeros((n_actions, horizon, 1), device=action.device, dtype=th.float32)
-            stiffness_action = th.zeros((n_actions, horizon, 1), device=action.device, dtype=th.float32)
-            action = th.cat([damping_action, stiffness_action, action], dim=-1)
-        action = action.reshape(n_actions, horizon * (self.action_dim + 2))
-
-        return action
 
     def collect_rollouts(
             self,
