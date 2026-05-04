@@ -273,6 +273,12 @@ class FAST(OffPolicyAlgorithm):
         else:
             self.lookahead_k = int(cfg_lookahead_k)
 
+        # When True, the critic's first layer is widened by base_action_dim so
+        # Q conditions on the lookahead window in addition to the residual action.
+        # Gated (default False) because flipping it on changes the critic's input
+        # shape and breaks loading of any critic weights saved without it.
+        self.critic_use_base_action = bool(self.cfg.policy.get("critic_use_base_action", False))
+
         # Full base-policy prediction horizon. Read from cfg (not the wrapper) so it's
         # available during _setup_model — diffusion_policy is attached later in
         # train_fast.py, and FAST.load runs _setup_model before that attachment too.
@@ -434,6 +440,7 @@ class FAST(OffPolicyAlgorithm):
             diffusion_act_dim=self.action_dim,
             rl_single_step=self.rl_single_step,
             lookahead_k=self.lookahead_k,
+            critic_use_base_action=self.critic_use_base_action,
         )
         
         self.policy = self.policy_class(
@@ -502,6 +509,17 @@ class FAST(OffPolicyAlgorithm):
         for optimizer in optimizers:
             lr = critic_lr if optimizer is self.critic.optimizer else actor_lr
             update_learning_rate(optimizer, lr)
+
+    def _critic_action(self, actions: th.Tensor, base_action: th.Tensor) -> th.Tensor:
+        """Concatenate the lookahead base_action onto the residual action for critic input.
+
+        No-op when critic_use_base_action is False, preserving the legacy critic shape and
+        the loadability of pre-flag checkpoints. When True, the critic's first layer was
+        widened in policies.make_critic to accept the cat.
+        """
+        if not self.critic_use_base_action:
+            return actions
+        return th.cat([actions, base_action], dim=-1)
 
     def _filter_rl_obs(self, obs, add_noise: bool = True):
         # Buffer stores full env obs; actor/critic only know the RL subset.
@@ -586,7 +604,10 @@ class FAST(OffPolicyAlgorithm):
                 next_actions = th.tensor(self.policy.unscale_action(next_action_dict['final_action'].cpu().numpy())).to(self.device)
                 next_log_prob = next_action_dict['log_prob']
                 # Compute the next Q values: min over all critics targets
-                next_q_values = th.cat(self.critic_target(self._filter_rl_obs(replay_data.next_observations), next_actions), dim=1)
+                next_q_values = th.cat(self.critic_target(
+                    self._filter_rl_obs(replay_data.next_observations),
+                    self._critic_action(next_actions, replay_data.next_base_actions),
+                ), dim=1)
                 if self.min_q_heads is not None:
                     # REDQ-style target: min over a random subset of size min_q_heads.
                     n_critics = next_q_values.shape[1]
@@ -608,7 +629,10 @@ class FAST(OffPolicyAlgorithm):
 
             # Get current Q-values estimates for each critic network
 			# using action from the replay buffer
-            current_q_values = self.critic(self._filter_rl_obs(replay_data.observations), replay_data.actions)
+            current_q_values = self.critic(
+                self._filter_rl_obs(replay_data.observations),
+                self._critic_action(replay_data.actions, replay_data.base_actions),
+            )
 
             # compute critic loss
             critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
@@ -626,7 +650,10 @@ class FAST(OffPolicyAlgorithm):
                 # Compute actor loss
 				# Alternative: actor_loss = th.mean(log_prob - qf1_pi)
 				# Min over all critic networks
-                q_values_pi = th.cat(self.critic(self._filter_rl_obs(replay_data.observations), actions_pi), dim=1)
+                q_values_pi = th.cat(self.critic(
+                    self._filter_rl_obs(replay_data.observations),
+                    self._critic_action(actions_pi, replay_data.base_actions),
+                ), dim=1)
                 if self.policy_gradient_type == 'ensemble_mean':
                     min_qf_pi = th.mean(q_values_pi, dim=1, keepdim=True)
                 elif self.critic_backup_combine_type == 'min':
@@ -900,10 +927,15 @@ class FAST(OffPolicyAlgorithm):
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
         sample_base: bool = False,
-    ) -> tuple[np.ndarray, Optional[tuple[np.ndarray, ...]]]:
+    ) -> dict[str, np.ndarray]:
         """
         Get the policy action from an observation (and optional hidden state).
         Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        Returns a dict so callers can opt into auxiliary outputs (e.g. the
+        lookahead base_action window for eval-time Q-stitching) without forcing
+        signature changes on every consumer when new fields are added. Always
+        present: 'final_action'. Usually present: 'scaled_action', 'base_action'.
 
         :param observation: the input observation
         :param state: The last hidden states (can be None, used in recurrent policies)
@@ -911,8 +943,9 @@ class FAST(OffPolicyAlgorithm):
             this correspond to beginning of episodes,
             where the hidden states of the RNN must be reset.
         :param deterministic: Whether or not to return deterministic actions.
-        :return: the model's action and the next hidden state
-            (used in recurrent policies)
+        :return: dict with 'final_action' (env action), 'scaled_action' (residual
+            output, may be None), 'base_action' (lookahead window of base policy
+            slots used to condition the residual this step).
         """
         if self.jumpstart == "curriculum":
             # TODO: for now, automatically use full residual mag for jsrl
@@ -920,7 +953,7 @@ class FAST(OffPolicyAlgorithm):
         else:
             # Setting residual scale based on residual scale schedule.
             residual_mag = min(self.num_timesteps / self.residual_mag_schedule, 1.0)
-        
+
         action_dict = self.get_combined_action(
             observation=observation,
             state=state,
@@ -930,7 +963,11 @@ class FAST(OffPolicyAlgorithm):
             random_action_dict={},
             residual_mag=residual_mag,
         )
-        return action_dict['final_action'], action_dict.get('scaled_action', None)
+        return {
+            'final_action': action_dict['final_action'],
+            'scaled_action': action_dict.get('scaled_action', None),
+            'base_action': action_dict.get('base_action', None),
+        }
 
     def get_combined_log_prob(
         self,

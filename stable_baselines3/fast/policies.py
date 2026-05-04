@@ -260,6 +260,7 @@ class ResidualSACPolicy(SACPolicy):
         diffusion_act_dim: int = 1,
         rl_single_step: bool = False,
         lookahead_k: Optional[int] = None,
+        critic_use_base_action: bool = False,
     ):
         self.policy_type = policy_type
         self.chunk_size = chunk_size
@@ -289,6 +290,7 @@ class ResidualSACPolicy(SACPolicy):
             lookahead_k = self.effective_rl_chunk
         self.lookahead_k = int(lookahead_k)
         self.base_action_dim = self.lookahead_k * self.act_dim
+        self.critic_use_base_action = bool(critic_use_base_action)
 
         super().__init__(
             observation_space,
@@ -342,6 +344,25 @@ class ResidualSACPolicy(SACPolicy):
         # Under single-step lookahead, base_action_dim != action_space.shape[0].
         actor_kwargs["features_dim"] += self.base_action_dim
         return ResidualActor(**actor_kwargs).to(self.device)
+
+    def make_critic(self, features_extractor: Optional[BaseFeaturesExtractor] = None) -> ContinuousCritic:
+        """
+        When critic_use_base_action is True, inflate the action_space passed into ContinuousCritic
+        so its first Q-net layer reserves room for the lookahead window concatenated onto the
+        residual action: Q(s, [residual_action, base_action_window]). The cat happens in
+        FAST.train() at the call sites; this method only sizes the layers.
+        """
+        if not self.critic_use_base_action:
+            return super().make_critic(features_extractor)
+        critic_kwargs = self._update_features_extractor(self.critic_kwargs, features_extractor)
+        original_action_space = critic_kwargs["action_space"]
+        pad = np.ones(self.base_action_dim, dtype=original_action_space.dtype)
+        critic_kwargs["action_space"] = spaces.Box(
+            low=np.concatenate([original_action_space.low, -pad]),
+            high=np.concatenate([original_action_space.high, pad]),
+            dtype=original_action_space.dtype,
+        )
+        return ContinuousCritic(**critic_kwargs).to(self.device)
 
     def predict(
         self,
