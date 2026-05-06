@@ -880,6 +880,7 @@ class FAST(OffPolicyAlgorithm):
         episode_start: Optional[np.ndarray] = None,
         deterministic: bool = False,
         sample_base: bool = False,
+        sample_base_mask: Optional[np.ndarray] = None,
     ) -> dict[str, np.ndarray]:
         """
         Get the policy action from an observation (and optional hidden state).
@@ -896,6 +897,13 @@ class FAST(OffPolicyAlgorithm):
             this correspond to beginning of episodes,
             where the hidden states of the RNN must be reset.
         :param deterministic: Whether or not to return deterministic actions.
+        :param sample_base: If True, return base-policy action for every env in
+            the batch (legacy single-flag path).
+        :param sample_base_mask: Optional per-env bool mask of shape (n_envs,).
+            When provided it overrides ``sample_base``: the residual is computed
+            for the full batch and base actions are mux'd in for masked envs.
+            Lets async eval loops (where workers are at different episode
+            steps) drive curriculum-jumpstart sampling per worker.
         :return: dict with 'final_action' (env action), 'scaled_action' (residual
             output, may be None), 'base_action' (lookahead window of base policy
             slots used to condition the residual this step).
@@ -913,6 +921,7 @@ class FAST(OffPolicyAlgorithm):
             episode_start=episode_start,
             deterministic=deterministic,
             sample_base=sample_base,
+            sample_base_mask=sample_base_mask,
             random_action_dict={},
             residual_mag=residual_mag,
         )
@@ -972,6 +981,7 @@ class FAST(OffPolicyAlgorithm):
             episode_start: Optional[np.ndarray] = None,
             deterministic: bool = False,
             sample_base: bool = False,
+            sample_base_mask: Optional[np.ndarray] = None,
             random_action_dict: dict = {},
             residual_mag: float = 1.0,
     ) -> dict[str, np.ndarray]:
@@ -991,8 +1001,19 @@ class FAST(OffPolicyAlgorithm):
         return_dict['base_action'] = base_action
         return_dict['base_action_exec'] = base_action_exec
 
-        # If sample_base is True, return only the base action as the final action.
-        if sample_base:
+        # Per-env mux path: callers pass a bool mask to mix base-only and
+        # residual outputs in a single batched call. When all-True, fall
+        # through to the legacy `sample_base` early-return; when all-False,
+        # skip the mux entirely; otherwise compute the residual below and mux
+        # base_action_exec into masked rows at the end.
+        if sample_base_mask is not None:
+            sample_base_mask = np.asarray(sample_base_mask, dtype=bool)
+            if sample_base_mask.all():
+                return_dict['final_action'] = base_action_exec
+                return return_dict
+            if not sample_base_mask.any():
+                sample_base_mask = None  # nothing to mux; standard residual path
+        elif sample_base:
             return_dict['final_action'] = base_action_exec
             return return_dict
 
@@ -1037,13 +1058,20 @@ class FAST(OffPolicyAlgorithm):
         else:
             raise NotImplementedError("Only ResidualSACPolicy is implemented for FAST.")
 
+        # Per-env mux: replace masked rows with base_action_exec. Leave
+        # scaled_action / unscaled_action untouched — they're the residual the
+        # actor emitted, useful for logging even on base-sampled envs.
+        if sample_base_mask is not None:
+            mask_col = sample_base_mask[:, None]
+            final_action = np.where(mask_col, base_action_exec, final_action)
+
         # Add fast action and final action to return dict.
         return_dict['scaled_action'] = scaled_action
         return_dict['unscaled_action'] = unscaled_action
         return_dict['final_action'] = final_action
 
         return return_dict
-    
+
     def sample_base_policy(
         self,
         observation: Union[np.ndarray, th.Tensor, dict[str, Union[np.ndarray, th.Tensor]]],
