@@ -280,7 +280,6 @@ class FAST(OffPolicyAlgorithm):
         # Extracting RL policy config params.
         self.policy_type = self.cfg.policy.type
         self.policy_impedance_mode = self.cfg.policy.impedance_mode
-        self.policy_smooth_gain_lambda = self.cfg.policy.smooth_gain_lambda
         self.shape_rewards = self.cfg.policy.shape_rewards
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
@@ -504,7 +503,6 @@ class FAST(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
-        final_actor_losses, smooth_gain_losses = [], []
 
         if self.actor_gradient_steps < 0:
             actor_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
@@ -613,45 +611,12 @@ class FAST(OffPolicyAlgorithm):
                 actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
                 actor_losses.append(actor_loss.item())
 
-                # TODO: MAYBE APPLY SCHEDULE FOR SMOOTH GAIN LAMBDA?
-                if self.policy_smooth_gain_lambda > 0.0 and self.policy_impedance_mode != "fixed":
-                    smooth_gain_loss = self.smooth_gain_loss(actions_pi, replay_data.observations, self.policy_smooth_gain_lambda)
-                    smooth_gain_losses.append(smooth_gain_loss.item())
-
-                    # Debugging gradients; only for first gradient step.
-                    if self.cfg.debug_gradients and gradient_step == 0:
-                        # Backup original actor loss for logging
-                        self.actor.optimizer.zero_grad()
-                        actor_loss.backward(retain_graph=True)
-                        grad_norm_actor = th.zeros((), device=self.device)
-                        for p in self.actor.parameters():
-                            if p.grad is not None:
-                                grad_norm_actor += p.grad.norm().item() ** 2
-                        self.logger.record("debug/actor_grad_norm", grad_norm_actor)
-                        # Backup smoothness gain loss for logging
-                        self.actor.optimizer.zero_grad()
-                        smooth_gain_loss.backward(retain_graph=True)
-                        grad_norm_smooth = th.zeros((), device=self.device)
-                        for p in self.actor.parameters():
-                            if p.grad is not None:
-                                grad_norm_smooth += p.grad.norm().item() ** 2
-                        grad_norm_smooth = th.sqrt(grad_norm_smooth)
-                        self.logger.record("debug/smooth_gain_grad_norm", grad_norm_smooth)
-                    else:
-                        # Optimize the actor with combined loss.
-                        final_actor_loss = actor_loss + smooth_gain_loss
-                        self.actor.optimizer.zero_grad()
-                        final_actor_loss.backward()
-                    if self.grad_clip_norm is not None:
-                        th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
-                    self.actor.optimizer.step()
-                else:
-                    # Optimize the actor with actor loss only.
-                    self.actor.optimizer.zero_grad()
-                    actor_loss.backward()
-                    if self.grad_clip_norm is not None:
-                        th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
-                    self.actor.optimizer.step()
+                # Optimize the actor.
+                self.actor.optimizer.zero_grad()
+                actor_loss.backward()
+                if self.grad_clip_norm is not None:
+                    th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
+                self.actor.optimizer.step()
 
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
@@ -664,8 +629,6 @@ class FAST(OffPolicyAlgorithm):
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/ent_coef", np.mean(ent_coefs))
         self.logger.record("train/actor_loss", np.mean(actor_losses))
-        if len(smooth_gain_losses) > 0:
-            self.logger.record("train/smooth_gain_loss", np.mean(smooth_gain_losses))
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
@@ -1150,20 +1113,6 @@ class FAST(OffPolicyAlgorithm):
 
     def get_shaped_rewards(self, action, obs):
         return -self.cfg.policy.time_penalty
-    
-    def smooth_gain_loss(self, actions, observations, smooth_gain_lambda):
-        assert self.control_obs, "smooth_gain_loss currently only supports control_obs=True."
-        bs = actions.shape[0]
-
-        action_gains = actions.reshape(bs, self.chunk_size, -1)[..., :2]  # Assuming first two dims are gains.
-        current_gains = observations[..., -2:]  # Assuming last two dims of obs are current gains.
-
-        gain_smoothness_penalty = th.cat([
-            current_gains.unsqueeze(1) - 2 * action_gains[:, [0], :] + action_gains[:, [1], :], # inter-chunk penalty
-            action_gains[:, 0:-2, :] - 2 * action_gains[:, 1:-1, :] + action_gains[:, 2:, :], # intra-chunk penalty
-        ], dim=1)
-        gain_smoothness_penalty = gain_smoothness_penalty.pow(2).mean() * smooth_gain_lambda
-        return gain_smoothness_penalty
 
     def collect_rollouts(
             self,
