@@ -284,6 +284,8 @@ class FAST(OffPolicyAlgorithm):
         self.residual_mag_schedule = self.cfg.policy.residual_mag_schedule
         self.residual_mag = self.cfg.policy.residual_mag
         self.gains_mag = self.cfg.policy.gains_mag
+        self.policy_smooth_gain_lambda = self.cfg.policy.get("smooth_gain_lambda", 0.0)
+        self.policy_smooth_gain_debug = self.cfg.policy.get("smooth_gain_debug", False)
 
         # Train-time proprio sensor noise on RL actor/critic inputs only.
         # Base policy is read via sample_base_policy() and is not affected.
@@ -503,6 +505,7 @@ class FAST(OffPolicyAlgorithm):
 
         ent_coef_losses, ent_coefs = [], []
         actor_losses, critic_losses = [], []
+        smooth_gain_losses = []
 
         if self.actor_gradient_steps < 0:
             actor_gradient_idx = np.linspace(0, gradient_steps-1, gradient_steps, dtype=int)
@@ -611,9 +614,44 @@ class FAST(OffPolicyAlgorithm):
                 actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
                 actor_losses.append(actor_loss.item())
 
-                # Optimize the actor.
-                self.actor.optimizer.zero_grad()
-                actor_loss.backward()
+                # Optional 2nd-diff penalty on post-tanh gain means.
+                smooth_active = (
+                    self.policy_smooth_gain_lambda > 0.0
+                    and self.policy_impedance_mode != "fixed"
+                    and self.chunk_size >= 3
+                )
+                if smooth_active:
+                    sg_loss = self.smooth_gain_loss(action_dict['mean_actions'])
+                    smooth_gain_losses.append(sg_loss.item())
+                    if self.policy_smooth_gain_debug:
+                        # Two extra backward passes to log per-loss grad norms separately.
+                        # These passes are measurement-only and are discarded before
+                        # the combined backward that feeds the optimizer step.
+                        self.actor.optimizer.zero_grad()
+                        actor_loss.backward(retain_graph=True)
+                        actor_grad_norm = sum(
+                            p.grad.norm().item() ** 2
+                            for p in self.actor.parameters() if p.grad is not None
+                        ) ** 0.5
+                        self.logger.record("debug/actor_grad_norm", actor_grad_norm)
+
+                        self.actor.optimizer.zero_grad()
+                        sg_loss.backward(retain_graph=True)
+                        sg_grad_norm = sum(
+                            p.grad.norm().item() ** 2
+                            for p in self.actor.parameters() if p.grad is not None
+                        ) ** 0.5
+                        self.logger.record("debug/smooth_gain_grad_norm", sg_grad_norm)
+
+                        self.actor.optimizer.zero_grad()
+                        (actor_loss + sg_loss).backward()
+                    else:
+                        self.actor.optimizer.zero_grad()
+                        (actor_loss + sg_loss).backward()
+                else:
+                    self.actor.optimizer.zero_grad()
+                    actor_loss.backward()
+
                 if self.grad_clip_norm is not None:
                     th.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_clip_norm)
                 self.actor.optimizer.step()
@@ -632,6 +670,8 @@ class FAST(OffPolicyAlgorithm):
         self.logger.record("train/critic_loss", np.mean(critic_losses))
         if len(ent_coef_losses) > 0:
             self.logger.record("train/ent_coef_loss", np.mean(ent_coef_losses))
+        if len(smooth_gain_losses) > 0:
+            self.logger.record("train/smooth_gain_loss", np.mean(smooth_gain_losses))
 
     def learn(
         self: SelfFAST,
@@ -915,9 +955,13 @@ class FAST(OffPolicyAlgorithm):
         else:
             base_action_exec = base_action
 
-        # Sample action from fast policy.
+        # Sample action from fast policy. Inlined two-step (mirrors Actor.action_log_prob)
+        # so we can keep `mean_actions` for the smooth-gain penalty.
         full_obs = {"obs": self._filter_rl_obs(observation), "base_action": base_action}
-        scaled_action, log_prob = self.policy.actor.action_log_prob(full_obs)
+        mean_actions, log_std, kwargs = self.policy.actor.get_action_dist_params(full_obs)
+        scaled_action, log_prob = self.policy.actor.action_dist.log_prob_from_params(
+            mean_actions, log_std, **kwargs
+        )
 
         # Combine base action and fast policy action.
         if isinstance(self.policy, ResidualSACPolicy):
@@ -935,6 +979,7 @@ class FAST(OffPolicyAlgorithm):
         return_dict['scaled_action'] = scaled_action
         return_dict['final_action'] = final_action
         return_dict['log_prob'] = log_prob
+        return_dict['mean_actions'] = mean_actions
         return return_dict
 
     def get_combined_action(
@@ -1113,6 +1158,18 @@ class FAST(OffPolicyAlgorithm):
 
     def get_shaped_rewards(self, action, obs):
         return -self.cfg.policy.time_penalty
+
+    def smooth_gain_loss(self, mean_actions: th.Tensor) -> th.Tensor:
+        """Within-chunk 2nd-difference penalty on post-tanh gain means.
+
+        Operates on means (matches deterministic eval) rather than reparam samples,
+        so the gradient on μ is not diluted by per-dim sampling noise ε.
+        Assumes the first 2 dims of each chunk step are gains (kp, damping).
+        """
+        bs = mean_actions.shape[0]
+        gains = th.tanh(mean_actions).reshape(bs, self.chunk_size, -1)[..., :2]
+        second_diff = gains[:, :-2] - 2 * gains[:, 1:-1] + gains[:, 2:]
+        return second_diff.pow(2).mean() * self.policy_smooth_gain_lambda
 
     def collect_rollouts(
             self,
