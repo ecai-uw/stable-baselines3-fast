@@ -621,7 +621,10 @@ class FAST(OffPolicyAlgorithm):
                     and self.chunk_size >= 3
                 )
                 if smooth_active:
-                    sg_loss = self.smooth_gain_loss(action_dict['mean_actions'])
+                    # controller_state ∈ [-gains_mag, gains_mag]; normalise to [-1, 1]
+                    # to match tanh(μ_gain) for the cross-chunk boundary 2nd-diff.
+                    prev_gains_norm = replay_data.observations["controller_state"] / self.gains_mag
+                    sg_loss = self.smooth_gain_loss(action_dict['mean_actions'], prev_gains_norm)
                     smooth_gain_losses.append(sg_loss.item())
                     if self.policy_smooth_gain_debug:
                         # Two extra backward passes to log per-loss grad norms separately.
@@ -1159,17 +1162,30 @@ class FAST(OffPolicyAlgorithm):
     def get_shaped_rewards(self, action, obs):
         return -self.cfg.policy.time_penalty
 
-    def smooth_gain_loss(self, mean_actions: th.Tensor) -> th.Tensor:
-        """Within-chunk 2nd-difference penalty on post-tanh gain means.
+    def smooth_gain_loss(
+        self,
+        mean_actions: th.Tensor,
+        prev_gains_norm: Optional[th.Tensor] = None,
+    ) -> th.Tensor:
+        """2nd-difference penalty on post-tanh gain means.
 
         Operates on means (matches deterministic eval) rather than reparam samples,
         so the gradient on μ is not diluted by per-dim sampling noise ε.
-        Assumes the first 2 dims of each chunk step are gains (kp, damping).
+        Assumes the first 2 dims of each chunk step are gains (damping, kp).
+
+        If prev_gains_norm is provided (controller_state / gains_mag, in [-1, 1]),
+        also includes the cross-chunk boundary 2nd-diff term so smoothness chains
+        across chunk boundaries rather than being reset at every replan.
         """
         bs = mean_actions.shape[0]
         gains = th.tanh(mean_actions).reshape(bs, self.chunk_size, -1)[..., :2]
-        second_diff = gains[:, :-2] - 2 * gains[:, 1:-1] + gains[:, 2:]
-        return second_diff.pow(2).mean() * self.policy_smooth_gain_lambda
+        intra = gains[:, :-2] - 2 * gains[:, 1:-1] + gains[:, 2:]
+        if prev_gains_norm is not None:
+            boundary = prev_gains_norm.unsqueeze(1) - 2 * gains[:, [0]] + gains[:, [1]]
+            diffs = th.cat([boundary, intra], dim=1)
+        else:
+            diffs = intra
+        return diffs.pow(2).mean() * self.policy_smooth_gain_lambda
 
     def collect_rollouts(
             self,
